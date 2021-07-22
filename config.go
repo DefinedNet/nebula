@@ -123,6 +123,8 @@ func (c *Config) CatchHUP(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				signal.Stop(ch)
+				close(ch)
 				return
 			case <-ch:
 				c.l.Info("Caught HUP, reloading config")
