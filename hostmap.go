@@ -385,18 +385,20 @@ func (hm *HostMap) Punchy(ctx context.Context, conn *udpConn) {
 	defer clockSource.Stop()
 
 	for {
+		remotes = hm.punchList(remotes[:0])
+		for _, rl := range remotes {
+			//TODO: CopyAddrs generates garbage but ForEach locks for the work here, figure out which way is better
+			for _, addr := range rl.CopyAddrs(hm.preferredRanges) {
+				metricsTxPunchy.Inc(1)
+				conn.WriteTo(b, addr)
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-clockSource.C:
-			remotes = hm.punchList(remotes[:0])
-			for _, rl := range remotes {
-				//TODO: CopyAddrs generates garbage but ForEach locks for the work here, figure out which way is better
-				for _, addr := range rl.CopyAddrs(hm.preferredRanges) {
-					metricsTxPunchy.Inc(1)
-					conn.WriteTo(b, addr)
-				}
-			}
+			continue
 		}
 	}
 }

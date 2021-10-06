@@ -338,11 +338,13 @@ func (lh *LightHouse) LhUpdateWorker(ctx context.Context, f EncWriter) {
 	defer clockSource.Stop()
 
 	for {
+		lh.SendUpdate(f)
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-clockSource.C:
-			lh.SendUpdate(f)
+			continue
 		}
 	}
 }
