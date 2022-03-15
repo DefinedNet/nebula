@@ -73,6 +73,14 @@ func NewLightHouseFromConfig(l *logrus.Logger, c *config.C, myVpnNet *net.IPNet,
 	if amLighthouse && nebulaPort == 0 {
 		return nil, util.NewContextualError("lighthouse.am_lighthouse enabled on node but no port number is set in config", nil, nil)
 	}
+	// If we're configured with port 0, learn which real port we got.
+	if nebulaPort == 0 && pc != nil {
+		uPort, err := pc.LocalAddr()
+		if err != nil {
+			return nil, util.NewContextualError("Failed to get listening port", nil, err)
+		}
+		nebulaPort = uint32(uPort.Port)
+	}
 
 	ones, _ := myVpnNet.Mask.Size()
 	h := LightHouse{
