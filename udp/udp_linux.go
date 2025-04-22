@@ -138,7 +138,7 @@ func (u *StdConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firew
 	for {
 		n, err := read(msgs)
 		if err != nil {
-			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
+			u.l.WithError(err).Error("udp socket is closed, exiting read loop")
 			return
 		}
 

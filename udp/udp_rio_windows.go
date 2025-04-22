@@ -129,7 +129,7 @@ func (u *RIOConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firew
 		// Just read one packet at a time
 		n, rua, err := u.receive(buffer)
 		if err != nil {
-			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
+			u.l.WithError(err).Error("udp socket is closed, exiting read loop")
 			return
 		}
 
