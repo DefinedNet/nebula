@@ -93,6 +93,9 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 		}
 	}
 
+	// Just for verification
+	l.Info("Built with reader error set to error level")
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// All non system modifying configuration consumption should live above this line
 	// tun config, listeners, anything modifying the computer should be below
