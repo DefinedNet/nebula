@@ -546,7 +546,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time
 
 		if !outTraffic {
 			// Send a punch packet to keep the NAT state alive
-			n.sendPunch(hostinfo)
+			//n.sendPunch(hostinfo)
 		}
 
 		return decision, hostinfo, primary
@@ -567,7 +567,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time
 		if !outTraffic {
 			// If we aren't sending or receiving traffic then its an unused tunnel and we don't to test the tunnel.
 			// Just maintain NAT state if configured to do so.
-			n.sendPunch(hostinfo)
+			//n.sendPunch(hostinfo)
 			n.trafficTimer.Add(hostinfo.localIndexId, n.checkInterval)
 			return doNothing, nil, nil
 
@@ -577,7 +577,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time
 			// This is similar to the old punchy behavior with a slight optimization.
 			// We aren't receiving traffic but we are sending it, punch on all known
 			// ips in case we need to re-prime NAT state
-			n.sendPunch(hostinfo)
+			//n.sendPunch(hostinfo)
 		}
 
 		if n.l.Level >= logrus.DebugLevel {
