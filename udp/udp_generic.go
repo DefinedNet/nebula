@@ -33,6 +33,19 @@ func NewGenericListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, b
 		return nil, err
 	}
 	if uc, ok := pc.(*net.UDPConn); ok {
+		rc, err := uc.SyscallConn()
+		if err == nil {
+			cerr := rc.Control(func(fd uintptr) {
+				if err := setUDPSocketNonblock(fd); err != nil {
+					l.WithError(err).Warn("Failed to set UDP socket non-blocking")
+				}
+			})
+			if cerr != nil {
+				l.WithError(cerr).Warn("Failed to configure UDP socket")
+			}
+		} else {
+			l.WithError(err).Warn("Failed to get UDP file descriptor")
+		}
 		return &GenericConn{UDPConn: uc, l: l}, nil
 	}
 	return nil, fmt.Errorf("Unexpected PacketConn: %T %#v", pc, pc)
@@ -40,6 +53,12 @@ func NewGenericListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, b
 
 func (u *GenericConn) WriteTo(b []byte, addr netip.AddrPort) error {
 	_, err := u.UDPConn.WriteToUDPAddrPort(b, addr)
+	if err != nil {
+		if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+			// Drop the packet if the socket would block
+			return nil
+		}
+	}
 	return err
 }
 
