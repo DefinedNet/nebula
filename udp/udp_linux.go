@@ -226,12 +226,16 @@ func (u *StdConn) writeTo6(b []byte, ip netip.AddrPort) error {
 			uintptr(u.sysFd),
 			uintptr(unsafe.Pointer(&b[0])),
 			uintptr(len(b)),
-			uintptr(0),
+			uintptr(unix.MSG_DONTWAIT),
 			uintptr(unsafe.Pointer(&rsa)),
 			uintptr(unix.SizeofSockaddrInet6),
 		)
 
 		if err != 0 {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				// Drop the packet if the kernel send buffer is full
+				return nil
+			}
 			return &net.OpError{Op: "sendto", Err: err}
 		}
 
@@ -257,12 +261,16 @@ func (u *StdConn) writeTo4(b []byte, ip netip.AddrPort) error {
 			uintptr(u.sysFd),
 			uintptr(unsafe.Pointer(&b[0])),
 			uintptr(len(b)),
-			uintptr(0),
+			uintptr(unix.MSG_DONTWAIT),
 			uintptr(unsafe.Pointer(&rsa)),
 			uintptr(unix.SizeofSockaddrInet4),
 		)
 
 		if err != 0 {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				// Kernel send buffer is full, drop packet
+				return nil
+			}
 			return &net.OpError{Op: "sendto", Err: err}
 		}
 
