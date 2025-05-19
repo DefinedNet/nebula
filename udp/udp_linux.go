@@ -79,6 +79,17 @@ func NewListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, batch in
 	//v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_INCOMING_CPU)
 	//l.Println(v, err)
 
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	l.Infof("Flags=%#x O_NONBLOCK=%v err=%v", flags, flags&unix.O_NONBLOCK != 0, err)
+
+	l.Infof("Setting socket to non-blocking")
+	syscall.SetNonblock(int(fd), true)
+
+	flags, err = unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	l.Infof("Flags=%#x O_NONBLOCK=%v err=%v", flags, flags&unix.O_NONBLOCK != 0, err)
+
+
+
 	return &StdConn{sysFd: fd, isV4: ip.Is4(), l: l, batch: batch}, err
 }
 
@@ -139,7 +150,7 @@ func (u *StdConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firew
 		n, err := read(msgs)
 		if err != nil {
 			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
-			return
+			//return
 		}
 
 		//metric.Update(int64(n))
@@ -179,6 +190,12 @@ func (u *StdConn) ReadSingle(msgs []rawMessage) (int, error) {
 		)
 
 		if err != 0 {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				if perr := u.waitRead(); perr != nil {
+					return 0, &net.OpError{Op: "poll", Err: perr}
+				}
+				continue
+			}
 			return 0, &net.OpError{Op: "recvmsg", Err: err}
 		}
 
@@ -200,10 +217,30 @@ func (u *StdConn) ReadMulti(msgs []rawMessage) (int, error) {
 		)
 
 		if err != 0 {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				if perr := u.waitRead(); perr != nil {
+					return 0, &net.OpError{Op: "poll", Err: perr}
+				}
+				continue
+			}
 			return 0, &net.OpError{Op: "recvmmsg", Err: err}
 		}
 
 		return int(n), nil
+	}
+}
+
+func (u *StdConn) waitRead() error {
+	pfd := []unix.PollFd{{Fd: int32(u.sysFd), Events: unix.POLLIN}}
+	for {
+		_, err := unix.Poll(pfd, -1)
+		if err == nil {
+			return nil
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		return err
 	}
 }
 
