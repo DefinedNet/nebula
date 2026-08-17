@@ -4,41 +4,318 @@
 package overlay
 
 import (
+	"crypto"
 	"fmt"
-	"net"
+	"io"
+	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"syscall"
+	"unsafe"
 
-	"github.com/sirupsen/logrus"
+	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/routing"
+	"github.com/slackhq/nebula/util"
+	"github.com/slackhq/nebula/wintun"
+	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ *net.IPNet) (Device, error) {
+type closer interface {
+	Close()
+}
+
+const tunGUIDLabel = "Fixed Nebula Windows GUID v1"
+
+type winTun struct {
+	Device          string
+	vpnNetworks     []netip.Prefix
+	MTU             int
+	Routes          atomic.Pointer[[]Route]
+	routeTree       atomic.Pointer[bart.Table[routing.Gateways]]
+	guid            windows.GUID
+	networkCategory networkCategory
+	setCategory     bool
+	bypassWDF       bool
+	wdfBypass       closer
+	l               *slog.Logger
+
+	tun *wintun.NativeTun
+}
+
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (Device, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in Windows")
 }
 
-func newTun(c *config.C, l *logrus.Logger, cidr *net.IPNet, multiqueue bool) (Device, error) {
-	useWintun := true
-	if err := checkWinTunExists(); err != nil {
-		l.WithError(err).Warn("Check Wintun driver failed, fallback to wintap driver")
-		useWintun = false
-	}
-
-	if useWintun {
-		device, err := newWinTun(c, l, cidr, multiqueue)
-		if err != nil {
-			return nil, fmt.Errorf("create Wintun interface failed, %w", err)
-		}
-		return device, nil
-	}
-
-	device, err := newWaterTun(c, l, cidr, multiqueue)
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*winTun, error) {
+	err := checkWinTunExists()
 	if err != nil {
-		return nil, fmt.Errorf("create wintap driver failed, %w", err)
+		return nil, fmt.Errorf("can not load the wintun driver: %w", err)
 	}
-	return device, nil
+
+	deviceName := c.GetString("tun.dev", "")
+	guid, err := generateGUIDByDeviceName(deviceName)
+	if err != nil {
+		return nil, fmt.Errorf("generate GUID failed: %w", err)
+	}
+
+	cat, setCat, err := parseNetworkCategory(c.GetString("tun.network_category", "private"))
+	if err != nil {
+		return nil, err
+	}
+
+	t := &winTun{
+		Device:          deviceName,
+		vpnNetworks:     vpnNetworks,
+		MTU:             c.GetInt("tun.mtu", DefaultMTU),
+		guid:            *guid,
+		networkCategory: cat,
+		setCategory:     setCat,
+		bypassWDF:       c.GetBool("tun.windows_bypass_wdf", true),
+		l:               l,
+	}
+
+	err = t.reload(c, true)
+	if err != nil {
+		return nil, err
+	}
+
+	var tunDevice wintun.Device
+	tunDevice, err = wintun.CreateTUNWithRequestedGUID(deviceName, guid, t.MTU)
+	if err != nil {
+		// Windows 10 has an issue with unclean shutdowns not fully cleaning up the wintun device.
+		// Trying a second time resolves the issue.
+		l.Debug("Failed to create wintun device, retrying", "error", err)
+		tunDevice, err = wintun.CreateTUNWithRequestedGUID(deviceName, guid, t.MTU)
+		if err != nil {
+			return nil, &NameError{
+				Name:       deviceName,
+				Underlying: fmt.Errorf("create TUN device failed: %w", err),
+			}
+		}
+	}
+	t.tun = tunDevice.(*wintun.NativeTun)
+
+	c.RegisterReloadCallback(func(c *config.C) {
+		err := t.reload(c, false)
+		if err != nil {
+			util.LogWithContextIfNeeded("failed to reload tun device", err, t.l)
+		}
+	})
+
+	return t, nil
+}
+
+func (t *winTun) reload(c *config.C, initial bool) error {
+	change, routes, err := getAllRoutesFromConfig(c, t.vpnNetworks, initial)
+	if err != nil {
+		return err
+	}
+
+	if !initial && !change {
+		return nil
+	}
+
+	routeTree, err := makeRouteTree(t.l, routes, false)
+	if err != nil {
+		return err
+	}
+
+	// Teach nebula how to handle the routes before establishing them in the system table
+	oldRoutes := t.Routes.Swap(&routes)
+	t.routeTree.Store(routeTree)
+
+	if !initial {
+		// Remove first, if the system removes a wanted route hopefully it will be re-added next
+		err := t.removeRoutes(findRemovedRoutes(routes, *oldRoutes))
+		if err != nil {
+			util.LogWithContextIfNeeded("Failed to remove routes", err, t.l)
+		}
+
+		// Ensure any routes we actually want are installed
+		err = t.addRoutes(true)
+		if err != nil {
+			// Catch any stray logs
+			util.LogWithContextIfNeeded("Failed to add routes", err, t.l)
+		}
+	}
+
+	return nil
+}
+
+func (t *winTun) Activate() error {
+	luid := winipcfg.LUID(t.tun.LUID())
+
+	err := luid.SetIPAddresses(t.vpnNetworks)
+	if err != nil {
+		return fmt.Errorf("failed to set address: %w", err)
+	}
+
+	err = t.addRoutes(false)
+	if err != nil {
+		return err
+	}
+
+	if t.setCategory {
+		// The wintun adapter takes a moment to register with the Network List
+		// Manager, so we apply the category in the background and retry until
+		// it shows up.
+		go applyNetworkCategory(t.l, t.guid, t.networkCategory)
+	}
+
+	if t.bypassWDF {
+		t.wdfBypass = installInterfaceBypass(t.l, uint64(t.tun.LUID()))
+	}
+
+	return nil
+}
+
+func (t *winTun) addRoutes(logErrors bool) error {
+	luid := winipcfg.LUID(t.tun.LUID())
+	routes := *t.Routes.Load()
+	foundDefault4 := false
+
+	for _, r := range routes {
+		if len(r.Via) == 0 || !r.Install {
+			// We don't allow route MTUs so only install routes with a via
+			continue
+		}
+
+		// Add our unsafe route as an on-link route to the nebula tun device.
+		err := luid.AddRoute(r.Cidr, unspecifiedNextHop(r.Cidr), uint32(r.Metric))
+		if err != nil {
+			retErr := util.NewContextualError("Failed to add route", map[string]any{"route": r}, err)
+			if logErrors {
+				retErr.Log(t.l)
+				continue
+			} else {
+				return retErr
+			}
+		} else {
+			t.l.Info("Added route", "route", r)
+		}
+
+		if !foundDefault4 {
+			if r.Cidr.Bits() == 0 && r.Cidr.Addr().BitLen() == 32 {
+				foundDefault4 = true
+			}
+		}
+	}
+
+	ipif, err := luid.IPInterface(windows.AF_INET)
+	if err != nil {
+		return fmt.Errorf("failed to get ip interface: %w", err)
+	}
+
+	ipif.NLMTU = uint32(t.MTU)
+	if foundDefault4 {
+		ipif.UseAutomaticMetric = false
+		ipif.Metric = 0
+	}
+
+	if err := ipif.Set(); err != nil {
+		return fmt.Errorf("failed to set ip interface: %w", err)
+	}
+	return nil
+}
+
+func (t *winTun) removeRoutes(routes []Route) error {
+	luid := winipcfg.LUID(t.tun.LUID())
+
+	for _, r := range routes {
+		if !r.Install {
+			continue
+		}
+
+		// See comment on luid.AddRoute
+		err := luid.DeleteRoute(r.Cidr, unspecifiedNextHop(r.Cidr))
+		if err != nil {
+			t.l.Error("Failed to remove route", "error", err, "route", r)
+		} else {
+			t.l.Info("Removed route", "route", r)
+		}
+	}
+	return nil
+}
+
+func (t *winTun) RoutesFor(ip netip.Addr) routing.Gateways {
+	r, _ := t.routeTree.Load().Lookup(ip)
+	return r
+}
+
+func (t *winTun) Networks() []netip.Prefix {
+	return t.vpnNetworks
+}
+
+func (t *winTun) Name() string {
+	return t.Device
+}
+
+func (t *winTun) Read(b []byte) (int, error) {
+	return t.tun.Read(b, 0)
+}
+
+func (t *winTun) Write(b []byte) (int, error) {
+	return t.tun.Write(b, 0)
+}
+
+func (t *winTun) SupportsMultiqueue() bool {
+	return false
+}
+
+func (t *winTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
+	return nil, fmt.Errorf("TODO: multiqueue not implemented for windows")
+}
+
+func (t *winTun) Close() error {
+	// It seems that the Windows networking stack doesn't like it when we destroy interfaces that have active routes,
+	// so to be certain, just remove everything before destroying.
+	luid := winipcfg.LUID(t.tun.LUID())
+	_ = luid.FlushRoutes(windows.AF_INET)
+	_ = luid.FlushIPAddresses(windows.AF_INET)
+
+	_ = luid.FlushRoutes(windows.AF_INET6)
+	_ = luid.FlushIPAddresses(windows.AF_INET6)
+
+	_ = luid.FlushDNS(windows.AF_INET)
+	_ = luid.FlushDNS(windows.AF_INET6)
+
+	if t.wdfBypass != nil {
+		t.wdfBypass.Close()
+		t.wdfBypass = nil
+	}
+
+	return t.tun.Close()
+}
+
+func unspecifiedNextHop(p netip.Prefix) netip.Addr {
+	if p.Addr().Is4() {
+		return netip.IPv4Unspecified()
+	}
+	return netip.IPv6Unspecified()
+}
+
+func generateGUIDByDeviceName(name string) (*windows.GUID, error) {
+	// GUID is 128 bit
+	hash := crypto.MD5.New()
+
+	_, err := hash.Write([]byte(tunGUIDLabel))
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = hash.Write([]byte(name))
+	if err != nil {
+		return nil, err
+	}
+
+	sum := hash.Sum(nil)
+
+	return (*windows.GUID)(unsafe.Pointer(&sum[0])), nil
 }
 
 func checkWinTunExists() error {

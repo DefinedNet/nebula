@@ -7,6 +7,318 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-23
+
+See the [v1.11.0](https://github.com/slackhq/nebula/milestone/25?closed=1) milestone for a complete list of changes.
+
+### Breaking
+
+- Logging has switched from logrus to Go's structured `slog`. Log output changes: levels are upper case
+  (`level=INFO`), trace prints as `level=DEBUG-4`, timestamps are always RFC3339Nano and `logging.timestamp_format`
+  is ignored, and some messages were reworded. Review any log parsing before upgrading. This is also an API break
+  for embedders, as constructors now take a `*slog.Logger`. (#1672, #1734, #1621)
+- `firewall.inbound_action` and `firewall.outbound_action` (used to set reject vs. drop policy) were each being
+  applied to the opposite direction, that is now corrected. This only affects how blocked packets are answered, not
+  which packets the firewall allows or denies. If you set either of these you are getting the behavior of the other
+  one today and likely want to swap them before upgrading. (#1798)
+- On Windows, Nebula now installs WFP PERMIT filters for the nebula adapter and the listener port by default. WFP
+  sits below Windows Defender Firewall, so any WDF inbound rules you rely on for either will no longer apply. Set
+  `tun.windows_bypass_wdf` and `listen.windows_bypass_wdf` to false to leave WDF in charge. (#1710)
+- On Windows, the nebula device is now set to the `private` network category instead of whatever Windows decided,
+  which is usually `Public`. This makes the host firewall less restrictive on the overlay. Set
+  `tun.network_category` to `unset` to keep the old behavior. (#1710)
+- Reject packets for non-TCP now use ICMP code 13, communication administratively prohibited, instead of code 3,
+  port unreachable. Anything keying off the old code needs updating. (#1766, #1768)
+- The SSH debug server's profiling commands are now confined to `sshd.sandbox_dir`, which defaults to
+  `$TMP/nebula-debug`. Relative paths resolve inside it and absolute paths outside it are rejected, so anything
+  scripting `start-cpu-profile`, `save-heap-profile`, or `save-mutex-profile` with a path elsewhere needs the
+  directory set. The directory is not created for you. (#1622)
+
+### Added
+
+- Sign the Windows release binaries. (#1718)
+- Generate IPv6 reject packets, matching the existing IPv4 behavior. (#1766, #1767, #1768)
+- Accept `-` in `nebula-cert` to read from stdin or write to stdout. (#1714)
+- Search for both `config.yml` and `config.yaml` in service and command line modes. (#1717)
+- Add version labels to the Docker/OCI images. (#1772)
+- Rebind the listener and re-query lighthouses on macOS when the underlay network changes, so devices moving
+  between wifi and wired or between networks recover without waiting for dead tunnel detection. Controlled by
+  `listen.rebind_on_network_change` (default `true`, not reloadable). (#1816)
+
+### Changed
+
+- Reload the firewall when the unsafe networks in the certificate change. (#1719)
+- Reconfigure, start, and stop the stats listener on a config reload instead of requiring a restart. (#1670)
+- Update a static host's addresses when they change on reload. (#1713)
+- Don't require a port on ICMP firewall rules. (#1609)
+- Connection track ICMP traffic. (#1602)
+- Return `NODATA` instead of `NXDOMAIN` from the DNS server for a name that exists but has no record of the
+  requested type, so clients that query `AAAA` first (busybox/Alpine) fall through to `A`. (#1668)
+- Record the local host's details in the DNS server. (#1716)
+- Install Windows unsafe routes as link routes. (#1709)
+- Reduce relay handshake log spam, and only log a handshake send error at error level when the remote list
+  changes. (#1733, #1765, #1810)
+- Start, stop, and reload subsystems (DNS, stats, conntrack, ssh, punchy) cleanly without leaking goroutines. (#1640, #1654, #1661, #1667, #1669, #1708, #1806, #1815)
+- `Control` is now safe to stop and wait on from any lifecycle state, and a new `Control.Wait` blocks until nebula
+  has fully stopped and returns the first fatal reader error. Failed starts release the udp sockets and tun fd
+  instead of leaking them. (#1794)
+- Trigger an immediate lighthouse update when reconnecting to or adding a lighthouse instead of waiting for the next update tick. (#1645)
+- Bring the Darwin and OpenBSD tun implementations in line with the other BSDs. (#1703)
+- Update to build against go v1.26. (#1818)
+- Various dependency updates. (#1586, #1587, #1604, #1617, #1618, #1627, #1628, #1629, #1652, #1664, #1665, #1697, #1721, #1732, #1742, #1743, #1750, #1763, #1771, #1782, #1800, #1807)
+
+### Fixed
+
+- Fix a data race on a host's remote address that could send packets to the wrong address during a roam. (#1773)
+- Fix tunnels that could permanently escape connection manager monitoring. (#1752)
+- Fix a crash when reloading the SSH server's trusted keys. (#1787)
+- Fix hostmap corruption when a host has multiple overlay addresses. Each address now gets its own list instead of
+  a single shared chain, which also fixes two latent bugs on the add and makePrimary paths. (#1788, #1790)
+- Apply `remote_allow_list` IPv4 rules to 4-in-6 mapped addresses. (#1786)
+- Don't panic in the DNS server on a short or empty query name. (#1635)
+- Advance the replay window on relayed packets so a relay drops replayed frames instead of re-forwarding them. (#1751)
+- Fix a race in relay state handling. (#1753)
+- Lock replay window updates so concurrent readers can't corrupt it. (#1802)
+- Reject malformed handshakes more reliably, including invalid ed25519 key lengths. (#1601, #1756)
+- Properly handle `closetunnel` packets. (#1638)
+- Fix an IPv6 extension-header length overflow that could make the firewall parse the wrong protocol and ports. (#1789)
+- Fix relay re-establishment when a handshake arrives over a relay entry that a one-sided teardown left
+  `Disestablished`, which silently dropped every send until dead tunnel detection forced a re-handshake. (#1805)
+- Don't build new relay state on a tunnel that was just discarded. (#1796)
+- Don't delete the wrong pending hostinfo in the handshake manager. (#1811)
+- Don't call the packet reader after a UDP error on Darwin. (#1755)
+- Open the FreeBSD tun device non blocking. (#1666)
+
+## [1.10.3] - 2026-02-06
+
+### Security
+
+- Fix an issue where blocklist bypass is possible when using curve P256 since the signature can have 2 valid representations.
+  Both fingerprint representations will be tested against the blocklist.
+  Any newly issued P256 based certificates will have their signature clamped to the low-s form.
+  Nebula will assert the low-s signature form when validating certificates in a future version. [GHSA-69x3-g4r3-p962](https://github.com/slackhq/nebula/security/advisories/GHSA-69x3-g4r3-p962)
+
+### Changed
+
+- Improve error reporting if nebula fails to start due to a tun device naming issue. (#1588)
+
+## [1.10.2] - 2026-01-21
+
+### Fixed
+
+- Fix panic when using `use_system_route_table` that was introduced in v1.10.1. (#1580)
+
+### Changed
+
+- Fix some typos in comments. (#1582)
+- Dependency updates. (#1581)
+
+## [1.10.1] - 2026-01-16
+
+See the [v1.10.1](https://github.com/slackhq/nebula/milestone/26?closed=1) milestone for a complete list of changes.
+
+### Fixed
+
+- Fix a bug where an unsafe route derived from the system route table could be lost on a config reload. (#1573)
+- Fix the PEM banner for ECDSA P256 public keys. (#1552)
+- Fix a regression on Windows from 1.9.x where nebula could fall back to a less performant UDP listener if 
+  non-critical ioctls failed. (#1568)
+- Fix a bug in handshake processing when a peer sends an unexpected public key. (#1566)
+
+### Added
+
+- Add a config option to control accepting `recv_error` packets which defaults to `always`. (#1569)
+
+### Changed
+
+- Various dependency updates. (#1541, #1549, #1550, #1557, #1558, #1560, #1561, #1570, #1571)
+
+## [1.10.0] - 2025-12-04
+
+See the [v1.10.0](https://github.com/slackhq/nebula/milestone/16?closed=1) milestone for a complete list of changes.
+
+### Added
+
+- Support for ipv6 and multiple ipv4/6 addresses in the overlay.
+  A new v2 ASN.1 based certificate format.
+  Certificates now have a unified interface for external implementations.
+  (#1212, #1216, #1345, #1359, #1381, #1419, #1464, #1466, #1451, #1476, #1467, #1481, #1399, #1488, #1492, #1495, #1468, #1521, #1535, #1538)
+- Add the ability to mark packets on linux to better target nebula packets in iptables/nftables. (#1331)
+- Add ECMP support for `unsafe_routes`. (#1332)
+- PKCS11 support for P256 keys when built with `pkcs11` tag (#1153, #1482)
+
+### Changed
+
+- **NOTE**: `default_local_cidr_any` now defaults to false, meaning that any firewall rule
+  intended to target an `unsafe_routes` entry must explicitly declare it via the
+  `local_cidr` field. This is almost always the intended behavior. This flag is
+  deprecated and will be removed in a future release. (#1373)
+- Improve logging when a relay is in use on an inbound packet. (#1533)
+- Avoid fatal errors if `rountines` is > 1 on systems that don't support more than 1 routine. (#1531)
+- Log a warning if a firewall rule contains an `any` that negates a more restrictive filter. (#1513)
+- Accept encrypted CA passphrase from an environment variable. (#1421)
+- Allow handshaking with any trusted remote. (#1509)
+- Log only the count of blocklisted certificate fingerprints instead of the entire list. (#1525)
+- Don't fatal when the ssh server is unable to be configured successfully. (#1520)
+- Update to build against go v1.25. (#1483)
+- Allow projects using `nebula` as a library with userspace networking to configure the `logger` and build version. (#1239) 
+- Upgrade to `yaml.v3`. (#1148, #1371, #1438, #1478)
+
+### Fixed
+
+- Fix a potential bug with udp ipv4 only on darwin. (#1532)
+- Improve lost packet statistics. (#1441, #1537)
+- Honor `remote_allow_list` in hole punch response. (#1186)
+- Fix a panic when `tun.use_system_route_table` is `true` and a route lacks a destination. (#1437) 
+- Fix an issue when `tun.use_system_route_table: true` could result in heavy CPU utilization when many thousands of routes
+  are present. (#1326) 
+- Fix tests for 32 bit machines. (#1394)
+- Fix a possible 32bit integer underflow in config handling. (#1353)
+- Fix moving a udp address from one vpn address to another in the `static_host_map`
+  which could cause rapid re-handshaking with an incorrect remote. (#1259)
+- Improve smoke tests in environments where the docker network is not the default. (#1347)
+
+## [1.9.7] - 2025-10-10
+
+### Security
+
+- Fix an issue where Nebula could incorrectly accept and process a packet from an erroneous source IP when the sender's
+  certificate is configured with unsafe_routes (cert v1/v2) or multiple IPs (cert v2). (#1494)
+
+### Changed
+
+- Disable sending `recv_error` messages when a packet is received outside the allowable counter window. (#1459)
+- Improve error messages and remove some unnecessary fatal conditions in the Windows and generic udp listener. (#1453)
+
+## [1.9.6] - 2025-7-15
+
+### Added
+
+- Support dropping inactive tunnels. This is disabled by default in this release but can be enabled with `tunnels.drop_inactive`. See example config for more details. (#1413)
+
+### Fixed
+
+- Fix Darwin freeze due to presence of some Network Extensions (#1426)
+- Ensure the same relay tunnel is always used when multiple relay tunnels are present (#1422)
+- Fix Windows freeze due to ICMP error handling (#1412)
+- Fix relay migration panic (#1403)
+
+## [1.9.5] - 2024-12-05
+
+### Added
+
+- Gracefully ignore v2 certificates. (#1282)
+
+### Fixed
+
+- Fix relays that refuse to re-establish after one of the remote tunnel pairs breaks. (#1277)
+
+## [1.9.4] - 2024-09-09
+
+### Added
+
+- Support UDP dialing with gVisor. (#1181)
+
+### Changed
+
+- Make some Nebula state programmatically available via control object. (#1188)
+- Switch internal representation of IPs to netip, to prepare for IPv6 support
+  in the overlay. (#1173)
+- Minor build and cleanup changes. (#1171, #1164, #1162)
+- Various dependency updates. (#1195, #1190, #1174, #1168, #1167, #1161, #1147, #1146)
+
+### Fixed
+
+- Fix a bug on big endian hosts, like mips. (#1194)
+- Fix a rare panic if a local index collision happens. (#1191)
+- Fix integer wraparound in the calculation of handshake timeouts on 32-bit targets. (#1185)
+
+## [1.9.3] - 2024-06-06
+
+### Fixed
+
+- Initialize messageCounter to 2 instead of verifying later. (#1156)
+
+## [1.9.2] - 2024-06-03
+
+### Fixed
+
+- Ensure messageCounter is set before handshake is complete. (#1154)
+
+## [1.9.1] - 2024-05-29
+
+### Fixed
+
+- Fixed a potential deadlock in GetOrHandshake. (#1151)
+
+## [1.9.0] - 2024-05-07
+
+### Deprecated
+
+- This release adds a new setting `default_local_cidr_any` that defaults to
+  true to match previous behavior, but will default to false in the next
+  release (1.10). When set to false, `local_cidr` is matched correctly for
+  firewall rules on hosts acting as unsafe routers, and should be set for any
+  firewall rules you want to allow unsafe route hosts to access. See the issue
+  and example config for more details. (#1071, #1099)
+
+### Added
+
+- Nebula now has an official Docker image `nebulaoss/nebula` that is
+  distroless and contains just the `nebula` and `nebula-cert` binaries. You
+  can find it here: https://hub.docker.com/r/nebulaoss/nebula (#1037)
+
+- Experimental binaries for `loong64` are now provided. (#1003)
+
+- Added example service script for OpenRC. (#711)
+
+- The SSH daemon now supports inlined host keys. (#1054)
+
+- The SSH daemon now supports certificates with `sshd.trusted_cas`. (#1098)
+
+### Changed
+
+- Config setting `tun.unsafe_routes` is now reloadable. (#1083)
+
+- Small documentation and internal improvements. (#1065, #1067, #1069, #1108,
+  #1109, #1111, #1135)
+
+- Various dependency updates. (#1139, #1138, #1134, #1133, #1126, #1123, #1110,
+  #1094, #1092, #1087, #1086, #1085, #1072, #1063, #1059, #1055, #1053, #1047,
+  #1046, #1034, #1022)
+
+### Removed
+
+- Support for the deprecated `local_range` option has been removed. Please
+  change to `preferred_ranges` (which is also now reloadable). (#1043)
+
+- We are now building with go1.22, which means that for Windows you need at
+  least Windows 10 or Windows Server 2016. This is because support for earlier
+  versions was removed in Go 1.21. See https://go.dev/doc/go1.21#windows (#981)
+
+- Removed vagrant example, as it was unmaintained. (#1129)
+
+- Removed Fedora and Arch nebula.service files, as they are maintained in the
+  upstream repos. (#1128, #1132)
+
+- Remove the TCP round trip tracking metrics, as they never had correct data
+  and were an experiment to begin with. (#1114)
+
+### Fixed
+
+- Fixed a potential deadlock introduced in 1.8.1. (#1112)
+
+- Fixed support for Linux when IPv6 has been disabled at the OS level. (#787)
+
+- DNS will return NXDOMAIN now when there are no results. (#845)
+
+- Allow `::` in `lighthouse.dns.host`. (#1115)
+
+- Capitalization of `NotAfter` fixed in DNS TXT response. (#1127)
+
+- Don't log invalid certificates. It is untrusted data and can cause a large
+  volume of logs. (#1116)
+
 ## [1.8.2] - 2024-01-08
 
 ### Fixed
@@ -558,7 +870,19 @@ created.)
 
 - Initial public release.
 
-[Unreleased]: https://github.com/slackhq/nebula/compare/v1.8.2...HEAD
+[Unreleased]: https://github.com/slackhq/nebula/compare/v1.10.3...HEAD
+[1.10.3]: https://github.com/slackhq/nebula/releases/tag/v1.10.3
+[1.10.2]: https://github.com/slackhq/nebula/releases/tag/v1.10.2
+[1.10.1]: https://github.com/slackhq/nebula/releases/tag/v1.10.1
+[1.10.0]: https://github.com/slackhq/nebula/releases/tag/v1.10.0
+[1.9.7]: https://github.com/slackhq/nebula/releases/tag/v1.9.7
+[1.9.6]: https://github.com/slackhq/nebula/releases/tag/v1.9.6
+[1.9.5]: https://github.com/slackhq/nebula/releases/tag/v1.9.5
+[1.9.4]: https://github.com/slackhq/nebula/releases/tag/v1.9.4
+[1.9.3]: https://github.com/slackhq/nebula/releases/tag/v1.9.3
+[1.9.2]: https://github.com/slackhq/nebula/releases/tag/v1.9.2
+[1.9.1]: https://github.com/slackhq/nebula/releases/tag/v1.9.1
+[1.9.0]: https://github.com/slackhq/nebula/releases/tag/v1.9.0
 [1.8.2]: https://github.com/slackhq/nebula/releases/tag/v1.8.2
 [1.8.1]: https://github.com/slackhq/nebula/releases/tag/v1.8.1
 [1.8.0]: https://github.com/slackhq/nebula/releases/tag/v1.8.0

@@ -2,18 +2,32 @@ package nebula
 
 import (
 	"context"
-	"net"
+	"errors"
+	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/overlay"
-	"github.com/slackhq/nebula/udp"
 )
+
+type RunState int
+
+const (
+	StateUnknown RunState = iota
+	StateReady
+	StateStarted
+	StateStopping
+	StateStopped
+)
+
+var ErrAlreadyStarted = errors.New("nebula is already started")
+var ErrAlreadyStopped = errors.New("nebula cannot be restarted")
+var ErrUnknownState = errors.New("nebula state is invalid")
 
 // Every interaction here needs to take extra care to copy memory and not return or use arguments "as is" when touching
 // core. This means copying IP objects, slices, de-referencing pointers and taking the actual value, etc
@@ -21,39 +35,65 @@ import (
 type controlEach func(h *HostInfo)
 
 type controlHostLister interface {
-	QueryVpnIp(vpnIp iputil.VpnIp) *HostInfo
+	QueryVpnAddr(vpnAddr netip.Addr) *HostInfo
 	ForEachIndex(each controlEach)
-	ForEachVpnIp(each controlEach)
-	GetPreferredRanges() []*net.IPNet
+	ForEachVpnAddr(each controlEach)
+	GetPreferredRanges() []netip.Prefix
 }
 
 type Control struct {
-	f               *Interface
-	l               *logrus.Logger
-	ctx             context.Context
-	cancel          context.CancelFunc
-	sshStart        func()
-	statsStart      func()
-	dnsStart        func()
-	lighthouseStart func()
+	stateLock sync.Mutex
+	state     RunState
+
+	f                      *Interface
+	l                      *slog.Logger
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	sshStart               func()
+	statsStart             func()
+	dnsStart               func()
+	lighthouseStart        func()
+	networkChangeStart     func(rebind func())
+	connectionManagerStart func(context.Context)
 }
 
 type ControlHostInfo struct {
-	VpnIp                  net.IP                  `json:"vpnIp"`
-	LocalIndex             uint32                  `json:"localIndex"`
-	RemoteIndex            uint32                  `json:"remoteIndex"`
-	RemoteAddrs            []*udp.Addr             `json:"remoteAddrs"`
-	Cert                   *cert.NebulaCertificate `json:"cert"`
-	MessageCounter         uint64                  `json:"messageCounter"`
-	CurrentRemote          *udp.Addr               `json:"currentRemote"`
-	CurrentRelaysToMe      []iputil.VpnIp          `json:"currentRelaysToMe"`
-	CurrentRelaysThroughMe []iputil.VpnIp          `json:"currentRelaysThroughMe"`
+	VpnAddrs               []netip.Addr     `json:"vpnAddrs"`
+	LocalIndex             uint32           `json:"localIndex"`
+	RemoteIndex            uint32           `json:"remoteIndex"`
+	RemoteAddrs            []netip.AddrPort `json:"remoteAddrs"`
+	Cert                   cert.Certificate `json:"cert"`
+	MessageCounter         uint64           `json:"messageCounter"`
+	CurrentRemote          netip.AddrPort   `json:"currentRemote"`
+	CurrentRelaysToMe      []netip.Addr     `json:"currentRelaysToMe"`
+	CurrentRelaysThroughMe []netip.Addr     `json:"currentRelaysThroughMe"`
 }
 
-// Start actually runs nebula, this is a nonblocking call. To block use Control.ShutdownBlock()
-func (c *Control) Start() {
+// Start actually runs nebula, this is a nonblocking call.
+// Use Wait to block until nebula has fully stopped and to learn whether a fatal reader error caused the shutdown.
+func (c *Control) Start() error {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	switch c.state {
+	case StateReady:
+		//yay!
+	case StateStopped, StateStopping:
+		return ErrAlreadyStopped
+	case StateStarted:
+		return ErrAlreadyStarted
+	default:
+		return ErrUnknownState
+	}
+
 	// Activate the interface
-	c.f.activate()
+	err := c.f.activate()
+	if err != nil {
+		// Cancel before Close so a caller returning from Wait always observes a dead Context
+		c.cancel()
+		_ = c.f.Close()
+		c.state = StateStopped
+		return err
+	}
 
 	// Call all the delayed funcs that waited patiently for the interface to be created.
 	if c.sshStart != nil {
@@ -65,29 +105,80 @@ func (c *Control) Start() {
 	if c.dnsStart != nil {
 		go c.dnsStart()
 	}
+	if c.networkChangeStart != nil {
+		go c.networkChangeStart(c.RebindUDPServer)
+	}
+	if c.connectionManagerStart != nil {
+		go c.connectionManagerStart(c.ctx)
+	}
 	if c.lighthouseStart != nil {
 		c.lighthouseStart()
 	}
 
+	c.f.triggerShutdown = c.Stop
+
 	// Start reading packets.
 	c.f.run()
+	c.state = StateStarted
+	return nil
+}
+
+func (c *Control) State() RunState {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	return c.state
 }
 
 func (c *Control) Context() context.Context {
 	return c.ctx
 }
 
-// Stop signals nebula to shutdown and close all tunnels, returns after the shutdown is complete
+// Stop tears nebula down, closing all tunnels and releasing everything it holds.
+// Use Wait to block until the shutdown has completed.
+// A Control that has been stopped cannot be started again, Start will return ErrAlreadyStopped.
 func (c *Control) Stop() {
-	// Stop the handshakeManager (and other services), to prevent new tunnels from
-	// being created while we're shutting them all down.
-	c.cancel()
+	c.stateLock.Lock()
+	switch c.state {
+	case StateStarted:
+		// Fall through to the full teardown below
 
-	c.CloseAllTunnels(false)
-	if err := c.f.Close(); err != nil {
-		c.l.WithError(err).Error("Close interface failed")
+	case StateReady:
+		// Never started
+		c.cancel()
+		c.state = StateStopped
+		if err := c.f.Close(); err != nil {
+			c.l.Error("Close interface failed", "error", err)
+		}
+		c.stateLock.Unlock()
+		return
+
+	default:
+		c.stateLock.Unlock()
+		// We are stopping or stopped already
+		return
 	}
-	c.l.Info("Goodbye")
+
+	c.state = StateStopping
+	c.stateLock.Unlock()
+
+	// Closing tunnels can be slow with a large hostmap, don't hold the lock for it
+	c.cancel()
+	c.CloseAllTunnels(false)
+
+	c.stateLock.Lock()
+	c.state = StateStopped
+	if err := c.f.Close(); err != nil {
+		c.l.Error("Close interface failed", "error", err)
+	}
+	c.stateLock.Unlock()
+}
+
+// Wait blocks until nebula has fully stopped, either via Stop or an internal fatal error,
+// and returns the first fatal packet reader error if there was one.
+// It is safe to call from multiple goroutines and at any point in the lifecycle,
+// but a Wait on a Control that is never started and never stopped will block forever.
+func (c *Control) Wait() error {
+	return c.f.wait()
 }
 
 // ShutdownBlock will listen for and block on term and interrupt signals, calling Control.Stop() once signalled
@@ -98,13 +189,24 @@ func (c *Control) ShutdownBlock() {
 
 	rawSig := <-sigChan
 	sig := rawSig.String()
-	c.l.WithField("signal", sig).Info("Caught signal, shutting down")
+	c.l.Info("Caught signal, shutting down", "signal", sig)
 	c.Stop()
 }
 
-// RebindUDPServer asks the UDP listener to rebind it's listener. Mainly used on mobile clients when interfaces change
+// RebindUDPServer asks the UDP listener to rebind it's listener. Mainly used on mobile clients when interfaces change.
 func (c *Control) RebindUDPServer() {
-	_ = c.f.outside.Rebind()
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+
+	if c.state != StateStarted {
+		return
+	}
+
+	// A failure here means we are likely still pinned to the interface we came up on, so the rest of this is
+	// unlikely to help. Say so instead of silently carrying on as if we rebound.
+	if err := c.f.outside.Rebind(); err != nil {
+		c.l.Error("Failed to rebind udp socket", "error", err)
+	}
 
 	// Trigger a lighthouse update, useful for mobile clients that should have an update interval of 0
 	c.f.lightHouse.SendUpdate()
@@ -131,8 +233,47 @@ func (c *Control) ListHostmapIndexes(pendingMap bool) []ControlHostInfo {
 	}
 }
 
-// GetHostInfoByVpnIp returns a single tunnels hostInfo, or nil if not found
-func (c *Control) GetHostInfoByVpnIp(vpnIp iputil.VpnIp, pending bool) *ControlHostInfo {
+// GetCertByVpnIp returns the authenticated certificate of the given vpn IP, or nil if not found
+func (c *Control) GetCertByVpnIp(vpnIp netip.Addr) cert.Certificate {
+	if c.f.myVpnAddrsTable.Contains(vpnIp) {
+		// Only returning the default certificate since its impossible
+		// for any other host but ourselves to have more than 1
+		return c.f.pki.getCertState().GetDefaultCertificate().Copy()
+	}
+	hi := c.f.hostMap.QueryVpnAddr(vpnIp)
+	if hi == nil {
+		return nil
+	}
+	return hi.GetCert().Certificate.Copy()
+}
+
+// CreateTunnel creates a new tunnel to the given vpn ip.
+func (c *Control) CreateTunnel(vpnIp netip.Addr) {
+	c.f.handshakeManager.StartHandshake(vpnIp, nil)
+}
+
+// PrintTunnel creates a new tunnel to the given vpn ip.
+func (c *Control) PrintTunnel(vpnIp netip.Addr) *ControlHostInfo {
+	hi := c.f.hostMap.QueryVpnAddr(vpnIp)
+	if hi == nil {
+		return nil
+	}
+	chi := copyHostInfo(hi, c.f.hostMap.GetPreferredRanges())
+	return &chi
+}
+
+// QueryLighthouse queries the lighthouse.
+func (c *Control) QueryLighthouse(vpnIp netip.Addr) *CacheMap {
+	hi := c.f.lightHouse.Query(vpnIp)
+	if hi == nil {
+		return nil
+	}
+	return hi.CopyCache()
+}
+
+// GetHostInfoByVpnAddr returns a single tunnels hostInfo, or nil if not found
+// Caller should take care to Unmap() any 4in6 addresses prior to calling.
+func (c *Control) GetHostInfoByVpnAddr(vpnAddr netip.Addr, pending bool) *ControlHostInfo {
 	var hl controlHostLister
 	if pending {
 		hl = c.f.handshakeManager
@@ -140,30 +281,32 @@ func (c *Control) GetHostInfoByVpnIp(vpnIp iputil.VpnIp, pending bool) *ControlH
 		hl = c.f.hostMap
 	}
 
-	h := hl.QueryVpnIp(vpnIp)
+	h := hl.QueryVpnAddr(vpnAddr)
 	if h == nil {
 		return nil
 	}
 
-	ch := copyHostInfo(h, c.f.hostMap.preferredRanges)
+	ch := copyHostInfo(h, c.f.hostMap.GetPreferredRanges())
 	return &ch
 }
 
 // SetRemoteForTunnel forces a tunnel to use a specific remote
-func (c *Control) SetRemoteForTunnel(vpnIp iputil.VpnIp, addr udp.Addr) *ControlHostInfo {
-	hostInfo := c.f.hostMap.QueryVpnIp(vpnIp)
+// Caller should take care to Unmap() any 4in6 addresses prior to calling.
+func (c *Control) SetRemoteForTunnel(vpnIp netip.Addr, addr netip.AddrPort) *ControlHostInfo {
+	hostInfo := c.f.hostMap.QueryVpnAddr(vpnIp)
 	if hostInfo == nil {
 		return nil
 	}
 
-	hostInfo.SetRemote(addr.Copy())
-	ch := copyHostInfo(hostInfo, c.f.hostMap.preferredRanges)
+	hostInfo.SetRemote(addr)
+	ch := copyHostInfo(hostInfo, c.f.hostMap.GetPreferredRanges())
 	return &ch
 }
 
 // CloseTunnel closes a fully established tunnel. If localOnly is false it will notify the remote end as well.
-func (c *Control) CloseTunnel(vpnIp iputil.VpnIp, localOnly bool) bool {
-	hostInfo := c.f.hostMap.QueryVpnIp(vpnIp)
+// Caller should take care to Unmap() any 4in6 addresses prior to calling.
+func (c *Control) CloseTunnel(vpnIp netip.Addr, localOnly bool) bool {
+	hostInfo := c.f.hostMap.QueryVpnAddr(vpnIp)
 	if hostInfo == nil {
 		return false
 	}
@@ -187,29 +330,26 @@ func (c *Control) CloseTunnel(vpnIp iputil.VpnIp, localOnly bool) bool {
 // CloseAllTunnels is just like CloseTunnel except it goes through and shuts them all down, optionally you can avoid shutting down lighthouse tunnels
 // the int returned is a count of tunnels closed
 func (c *Control) CloseAllTunnels(excludeLighthouses bool) (closed int) {
-	//TODO: this is probably better as a function in ConnectionManager or HostMap directly
-	lighthouses := c.f.lightHouse.GetLighthouses()
-
 	shutdown := func(h *HostInfo) {
-		if excludeLighthouses {
-			if _, ok := lighthouses[h.vpnIp]; ok {
-				return
-			}
+		if excludeLighthouses && c.f.lightHouse.IsAnyLighthouseAddr(h.vpnAddrs) {
+			return
 		}
 		c.f.send(header.CloseTunnel, 0, h.ConnectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
 		c.f.closeTunnel(h)
 
-		c.l.WithField("vpnIp", h.vpnIp).WithField("udpAddr", h.remote).
-			Debug("Sending close tunnel message")
+		c.l.Debug("Sending close tunnel message",
+			"vpnAddrs", h.vpnAddrs,
+			"udpAddr", h.GetRemote(),
+		)
 		closed++
 	}
 
 	// Learn which hosts are being used as relays, so we can shut them down last.
-	relayingHosts := map[iputil.VpnIp]*HostInfo{}
+	relayingHosts := map[netip.Addr]*HostInfo{}
 	// Grab the hostMap lock to access the Relays map
 	c.f.hostMap.Lock()
 	for _, relayingHost := range c.f.hostMap.Relays {
-		relayingHosts[relayingHost.vpnIp] = relayingHost
+		relayingHosts[relayingHost.vpnAddrs[0]] = relayingHost
 	}
 	c.f.hostMap.Unlock()
 
@@ -217,7 +357,7 @@ func (c *Control) CloseAllTunnels(excludeLighthouses bool) (closed int) {
 	// Grab the hostMap lock to access the Hosts map
 	c.f.hostMap.Lock()
 	for _, relayHost := range c.f.hostMap.Indexes {
-		if _, ok := relayingHosts[relayHost.vpnIp]; !ok {
+		if _, ok := relayingHosts[relayHost.vpnAddrs[0]]; !ok {
 			hostInfos = append(hostInfos, relayHost)
 		}
 	}
@@ -236,15 +376,19 @@ func (c *Control) Device() overlay.Device {
 	return c.f.inside
 }
 
-func copyHostInfo(h *HostInfo, preferredRanges []*net.IPNet) ControlHostInfo {
-
+func copyHostInfo(h *HostInfo, preferredRanges []netip.Prefix) ControlHostInfo {
 	chi := ControlHostInfo{
-		VpnIp:                  h.vpnIp.ToIP(),
+		VpnAddrs:               make([]netip.Addr, len(h.vpnAddrs)),
 		LocalIndex:             h.localIndexId,
 		RemoteIndex:            h.remoteIndexId,
 		RemoteAddrs:            h.remotes.CopyAddrs(preferredRanges),
 		CurrentRelaysToMe:      h.relayState.CopyRelayIps(),
 		CurrentRelaysThroughMe: h.relayState.CopyRelayForIps(),
+		CurrentRemote:          h.GetRemote(),
+	}
+
+	for i, a := range h.vpnAddrs {
+		chi.VpnAddrs[i] = a
 	}
 
 	if h.ConnectionState != nil {
@@ -252,11 +396,7 @@ func copyHostInfo(h *HostInfo, preferredRanges []*net.IPNet) ControlHostInfo {
 	}
 
 	if c := h.GetCert(); c != nil {
-		chi.Cert = c.Copy()
-	}
-
-	if h.remote != nil {
-		chi.CurrentRemote = h.remote.Copy()
+		chi.Cert = c.Certificate.Copy()
 	}
 
 	return chi
@@ -265,7 +405,7 @@ func copyHostInfo(h *HostInfo, preferredRanges []*net.IPNet) ControlHostInfo {
 func listHostMapHosts(hl controlHostLister) []ControlHostInfo {
 	hosts := make([]ControlHostInfo, 0)
 	pr := hl.GetPreferredRanges()
-	hl.ForEachVpnIp(func(hostinfo *HostInfo) {
+	hl.ForEachVpnAddr(func(hostinfo *HostInfo) {
 		hosts = append(hosts, copyHostInfo(hostinfo, pr))
 	})
 	return hosts

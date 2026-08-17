@@ -4,72 +4,95 @@
 package overlay
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
 	"os"
-	"os/exec"
 	"regexp"
-	"strconv"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 
-	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula/cidr"
+	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
+	netroute "golang.org/x/net/route"
+	"golang.org/x/sys/unix"
 )
 
+const (
+	SIOCAIFADDR_IN6 = 0x8080691a
+)
+
+type ifreqAlias4 struct {
+	Name     [unix.IFNAMSIZ]byte
+	Addr     unix.RawSockaddrInet4
+	DstAddr  unix.RawSockaddrInet4
+	MaskAddr unix.RawSockaddrInet4
+}
+
+type ifreqAlias6 struct {
+	Name       [unix.IFNAMSIZ]byte
+	Addr       unix.RawSockaddrInet6
+	DstAddr    unix.RawSockaddrInet6
+	PrefixMask unix.RawSockaddrInet6
+	Flags      uint32
+	Lifetime   [2]uint32
+}
+
+type ifreq struct {
+	Name [unix.IFNAMSIZ]byte
+	data int
+}
+
 type tun struct {
-	Device    string
-	cidr      *net.IPNet
-	MTU       int
-	Routes    atomic.Pointer[[]Route]
-	routeTree atomic.Pointer[cidr.Tree4[iputil.VpnIp]]
-	l         *logrus.Logger
-
-	io.ReadWriteCloser
-
-	// cache out buffer since we need to prepend 4 bytes for tun metadata
-	out []byte
-}
-
-func (t *tun) Close() error {
-	if t.ReadWriteCloser != nil {
-		return t.ReadWriteCloser.Close()
-	}
-
-	return nil
-}
-
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ *net.IPNet) (*tun, error) {
-	return nil, fmt.Errorf("newTunFromFd not supported in OpenBSD")
+	Device      string
+	vpnNetworks []netip.Prefix
+	MTU         int
+	Routes      atomic.Pointer[[]Route]
+	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
+	l           *slog.Logger
+	f           *os.File
+	fd          int
 }
 
 var deviceNameRE = regexp.MustCompile(`^tun[0-9]+$`)
 
-func newTun(c *config.C, l *logrus.Logger, cidr *net.IPNet, _ bool) (*tun, error) {
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (*tun, error) {
+	return nil, fmt.Errorf("newTunFromFd not supported in openbsd")
+}
+
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
+	// Try to open tun device
+	var err error
 	deviceName := c.GetString("tun.dev", "")
 	if deviceName == "" {
-		return nil, fmt.Errorf("a device name in the format of tunN must be specified")
+		return nil, fmt.Errorf("a device name in the format of /dev/tunN must be specified")
 	}
-
 	if !deviceNameRE.MatchString(deviceName) {
-		return nil, fmt.Errorf("a device name in the format of tunN must be specified")
+		return nil, fmt.Errorf("a device name in the format of /dev/tunN must be specified")
 	}
 
-	file, err := os.OpenFile("/dev/"+deviceName, os.O_RDWR, 0)
+	fd, err := unix.Open("/dev/"+deviceName, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
 
+	err = unix.SetNonblock(fd, true)
+	if err != nil {
+		l.Warn("Failed to set the tun device as nonblocking", "error", err)
+	}
+
 	t := &tun{
-		ReadWriteCloser: file,
-		Device:          deviceName,
-		cidr:            cidr,
-		MTU:             c.GetInt("tun.mtu", DefaultMTU),
-		l:               l,
+		f:           os.NewFile(uintptr(fd), ""),
+		fd:          fd,
+		Device:      deviceName,
+		vpnNetworks: vpnNetworks,
+		MTU:         c.GetInt("tun.mtu", DefaultMTU),
+		l:           l,
 	}
 
 	err = t.reload(c, true)
@@ -87,8 +110,217 @@ func newTun(c *config.C, l *logrus.Logger, cidr *net.IPNet, _ bool) (*tun, error
 	return t, nil
 }
 
+func (t *tun) Close() error {
+	if t.f != nil {
+		if err := t.f.Close(); err != nil {
+			return fmt.Errorf("error closing tun file: %w", err)
+		}
+
+		// t.f.Close should have handled it for us but let's be extra sure
+		_ = unix.Close(t.fd)
+	}
+	return nil
+}
+
+// tunWritev and tunReadv are linkname'd to x/sys/unix's libc-routed writev/readv stubs so the
+// calls go through libc's pinned trampoline. OpenBSD's pinsyscall protection rejects a raw
+// syscall.Syscall(SYS_WRITEV/SYS_READV, ...) because it doesn't originate from a libc-pinned
+// address, so we can't use the syscall.Syscall pattern that freebsd / netbsd use. We pull the
+// low-level stubs instead of calling unix.Writev/unix.Readv because those take [][]byte and rebuild
+// the []Iovec every call, which heap-allocates the header; linkname'ing the stubs lets us hand them
+// our own stack-allocated iovecs. See golang/go#78049.
+
+//go:linkname tunWritev golang.org/x/sys/unix.writev
+//go:noescape
+func tunWritev(fd int, iovecs []unix.Iovec) (n int, err error)
+
+//go:linkname tunReadv golang.org/x/sys/unix.readv
+//go:noescape
+func tunReadv(fd int, iovecs []unix.Iovec) (n int, err error)
+
+// Read pulls one IP packet off the tun device, scattering the 4 byte protocol header away from the
+// packet so the payload lands directly in to.
+func (t *tun) Read(to []byte) (int, error) {
+	var head [4]byte
+
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+
+	var n int
+	var callErr error
+	err = rc.Read(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &to[0], Len: uint64(len(to))},
+		}
+		n, callErr = tunReadv(int(fd), iovecs)
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+	if n < 4 {
+		return 0, nil
+	}
+	return n - 4, nil
+}
+
+// Write pushes one IP packet onto the tun device.
+func (t *tun) Write(from []byte) (int, error) {
+	if len(from) == 0 {
+		return 0, syscall.EIO
+	}
+
+	ipVer := from[0] >> 4
+	var head [4]byte
+	switch ipVer {
+	case 4:
+		head[3] = syscall.AF_INET
+	case 6:
+		head[3] = syscall.AF_INET6
+	default:
+		return 0, fmt.Errorf("unable to determine IP version from packet")
+	}
+
+	// Grab rc as a local so the compiler can devirtualize the call and keep the closure on the stack.
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+
+	var n int
+	var callErr error
+	err = rc.Write(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &from[0], Len: uint64(len(from))},
+		}
+		n, callErr = tunWritev(int(fd), iovecs)
+		// Type-assert to syscall.Errno so the EAGAIN/EWOULDBLOCK/EINTR check doesn't box the errno
+		// constants into error interfaces on every call.
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+
+	return n - 4, nil
+}
+
+func (t *tun) addIp(cidr netip.Prefix) error {
+	if cidr.Addr().Is4() {
+		var req ifreqAlias4
+		req.Name = t.deviceBytes()
+		req.Addr = unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   cidr.Addr().As4(),
+		}
+		req.DstAddr = unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   cidr.Addr().As4(),
+		}
+		req.MaskAddr = unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   prefixToMask(cidr).As4(),
+		}
+
+		s, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_IP)
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(s)
+
+		if err := ioctl(uintptr(s), unix.SIOCAIFADDR, uintptr(unsafe.Pointer(&req))); err != nil {
+			return fmt.Errorf("failed to set tun address %s: %s", cidr.Addr(), err)
+		}
+
+		err = addRoute(cidr, t.vpnNetworks)
+		if err != nil {
+			return fmt.Errorf("failed to set route for vpn network %v: %w", cidr, err)
+		}
+
+		return nil
+	}
+
+	if cidr.Addr().Is6() {
+		var req ifreqAlias6
+		req.Name = t.deviceBytes()
+		req.Addr = unix.RawSockaddrInet6{
+			Len:    unix.SizeofSockaddrInet6,
+			Family: unix.AF_INET6,
+			Addr:   cidr.Addr().As16(),
+		}
+		req.PrefixMask = unix.RawSockaddrInet6{
+			Len:    unix.SizeofSockaddrInet6,
+			Family: unix.AF_INET6,
+			Addr:   prefixToMask(cidr).As16(),
+		}
+		req.Lifetime[0] = 0xffffffff
+		req.Lifetime[1] = 0xffffffff
+
+		s, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_IP)
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(s)
+
+		if err := ioctl(uintptr(s), SIOCAIFADDR_IN6, uintptr(unsafe.Pointer(&req))); err != nil {
+			return fmt.Errorf("failed to set tun address %s: %s", cidr.Addr().String(), err)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("unknown address type %v", cidr)
+}
+
+func (t *tun) Activate() error {
+	err := t.doIoctlByName(unix.SIOCSIFMTU, uint32(t.MTU))
+	if err != nil {
+		return fmt.Errorf("failed to set tun mtu: %w", err)
+	}
+
+	for i := range t.vpnNetworks {
+		err = t.addIp(t.vpnNetworks[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	return t.addRoutes(false)
+}
+
+func (t *tun) doIoctlByName(ctl uintptr, value uint32) error {
+	s, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_IP)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(s)
+
+	ir := ifreq{Name: t.deviceBytes(), data: int(value)}
+	err = ioctl(uintptr(s), ctl, uintptr(unsafe.Pointer(&ir)))
+	return err
+}
+
 func (t *tun) reload(c *config.C, initial bool) error {
-	change, routes, err := getAllRoutesFromConfig(c, t.cidr, initial)
+	change, routes, err := getAllRoutesFromConfig(c, t.vpnNetworks, initial)
 	if err != nil {
 		return err
 	}
@@ -124,53 +356,46 @@ func (t *tun) reload(c *config.C, initial bool) error {
 	return nil
 }
 
-func (t *tun) Activate() error {
-	var err error
-	// TODO use syscalls instead of exec.Command
-	cmd := exec.Command("/sbin/ifconfig", t.Device, t.cidr.String(), t.cidr.IP.String())
-	t.l.Debug("command: ", cmd.String())
-	if err = cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run 'ifconfig': %s", err)
-	}
-
-	cmd = exec.Command("/sbin/ifconfig", t.Device, "mtu", strconv.Itoa(t.MTU))
-	t.l.Debug("command: ", cmd.String())
-	if err = cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run 'ifconfig': %s", err)
-	}
-
-	cmd = exec.Command("/sbin/route", "-n", "add", "-inet", t.cidr.String(), t.cidr.IP.String())
-	t.l.Debug("command: ", cmd.String())
-	if err = cmd.Run(); err != nil {
-		return fmt.Errorf("failed to run 'route add': %s", err)
-	}
-
-	// Unsafe path routes
-	return t.addRoutes(false)
+func (t *tun) RoutesFor(ip netip.Addr) routing.Gateways {
+	r, _ := t.routeTree.Load().Lookup(ip)
+	return r
 }
 
-func (t *tun) RouteFor(ip iputil.VpnIp) iputil.VpnIp {
-	_, r := t.routeTree.Load().MostSpecificContains(ip)
-	return r
+func (t *tun) Networks() []netip.Prefix {
+	return t.vpnNetworks
+}
+
+func (t *tun) Name() string {
+	return t.Device
+}
+
+func (t *tun) SupportsMultiqueue() bool {
+	return false
+}
+
+func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
+	return nil, fmt.Errorf("TODO: multiqueue not implemented for openbsd")
 }
 
 func (t *tun) addRoutes(logErrors bool) error {
 	routes := *t.Routes.Load()
+
 	for _, r := range routes {
-		if r.Via == nil || !r.Install {
+		if len(r.Via) == 0 || !r.Install {
 			// We don't allow route MTUs so only install routes with a via
 			continue
 		}
 
-		cmd := exec.Command("/sbin/route", "-n", "add", "-inet", r.Cidr.String(), t.cidr.IP.String())
-		t.l.Debug("command: ", cmd.String())
-		if err := cmd.Run(); err != nil {
-			retErr := util.NewContextualError("failed to run 'route add' for unsafe_route", map[string]interface{}{"route": r}, err)
+		err := addRoute(r.Cidr, t.vpnNetworks)
+		if err != nil {
+			retErr := util.NewContextualError("Failed to add route", map[string]any{"route": r}, err)
 			if logErrors {
 				retErr.Log(t.l)
 			} else {
 				return retErr
 			}
+		} else {
+			t.l.Info("Added route", "route", r)
 		}
 	}
 
@@ -183,63 +408,125 @@ func (t *tun) removeRoutes(routes []Route) error {
 			continue
 		}
 
-		cmd := exec.Command("/sbin/route", "-n", "delete", "-inet", r.Cidr.String(), t.cidr.IP.String())
-		t.l.Debug("command: ", cmd.String())
-		if err := cmd.Run(); err != nil {
-			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+		err := delRoute(r.Cidr, t.vpnNetworks)
+		if err != nil {
+			t.l.Error("Failed to remove route", "error", err, "route", r)
 		} else {
-			t.l.WithField("route", r).Info("Removed route")
+			t.l.Info("Removed route", "route", r)
 		}
 	}
 	return nil
 }
 
-func (t *tun) Cidr() *net.IPNet {
-	return t.cidr
-}
-
-func (t *tun) Name() string {
-	return t.Device
-}
-
-func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for freebsd")
-}
-
-func (t *tun) Read(to []byte) (int, error) {
-	buf := make([]byte, len(to)+4)
-
-	n, err := t.ReadWriteCloser.Read(buf)
-
-	copy(to, buf[4:])
-	return n - 4, err
-}
-
-// Write is only valid for single threaded use
-func (t *tun) Write(from []byte) (int, error) {
-	buf := t.out
-	if cap(buf) < len(from)+4 {
-		buf = make([]byte, len(from)+4)
-		t.out = buf
+func (t *tun) deviceBytes() (o [16]byte) {
+	for i, c := range t.Device {
+		o[i] = byte(c)
 	}
-	buf = buf[:len(from)+4]
+	return
+}
 
-	if len(from) == 0 {
-		return 0, syscall.EIO
+func addRoute(prefix netip.Prefix, gateways []netip.Prefix) error {
+	sock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
+	}
+	defer unix.Close(sock)
+
+	route := &netroute.RouteMessage{
+		Version: unix.RTM_VERSION,
+		Type:    unix.RTM_ADD,
+		Flags:   unix.RTF_UP | unix.RTF_GATEWAY,
+		Seq:     1,
 	}
 
-	// Determine the IP Family for the NULL L2 Header
-	ipVer := from[0] >> 4
-	if ipVer == 4 {
-		buf[3] = syscall.AF_INET
-	} else if ipVer == 6 {
-		buf[3] = syscall.AF_INET6
+	if prefix.Addr().Is4() {
+		gw, err := selectGateway(prefix, gateways)
+		if err != nil {
+			return err
+		}
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet4Addr{IP: prefix.Masked().Addr().As4()},
+			unix.RTAX_NETMASK: &netroute.Inet4Addr{IP: prefixToMask(prefix).As4()},
+			unix.RTAX_GATEWAY: &netroute.Inet4Addr{IP: gw.Addr().As4()},
+		}
 	} else {
-		return 0, fmt.Errorf("unable to determine IP version from packet")
+		gw, err := selectGateway(prefix, gateways)
+		if err != nil {
+			return err
+		}
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet6Addr{IP: prefix.Masked().Addr().As16()},
+			unix.RTAX_NETMASK: &netroute.Inet6Addr{IP: prefixToMask(prefix).As16()},
+			unix.RTAX_GATEWAY: &netroute.Inet6Addr{IP: gw.Addr().As16()},
+		}
 	}
 
-	copy(buf[4:], from)
+	data, err := route.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to create route.RouteMessage: %w", err)
+	}
 
-	n, err := t.ReadWriteCloser.Write(buf)
-	return n - 4, err
+	_, err = unix.Write(sock, data[:])
+	if err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			// Try to do a change
+			route.Type = unix.RTM_CHANGE
+			data, err = route.Marshal()
+			if err != nil {
+				return fmt.Errorf("failed to create route.RouteMessage for change: %w", err)
+			}
+			_, err = unix.Write(sock, data[:])
+			return err
+		}
+		return fmt.Errorf("failed to write route.RouteMessage to socket: %w", err)
+	}
+
+	return nil
+}
+
+func delRoute(prefix netip.Prefix, gateways []netip.Prefix) error {
+	sock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
+	}
+	defer unix.Close(sock)
+
+	route := netroute.RouteMessage{
+		Version: unix.RTM_VERSION,
+		Type:    unix.RTM_DELETE,
+		Seq:     1,
+	}
+
+	if prefix.Addr().Is4() {
+		gw, err := selectGateway(prefix, gateways)
+		if err != nil {
+			return err
+		}
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet4Addr{IP: prefix.Masked().Addr().As4()},
+			unix.RTAX_NETMASK: &netroute.Inet4Addr{IP: prefixToMask(prefix).As4()},
+			unix.RTAX_GATEWAY: &netroute.Inet4Addr{IP: gw.Addr().As4()},
+		}
+	} else {
+		gw, err := selectGateway(prefix, gateways)
+		if err != nil {
+			return err
+		}
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet6Addr{IP: prefix.Masked().Addr().As16()},
+			unix.RTAX_NETMASK: &netroute.Inet6Addr{IP: prefixToMask(prefix).As16()},
+			unix.RTAX_GATEWAY: &netroute.Inet6Addr{IP: gw.Addr().As16()},
+		}
+	}
+
+	data, err := route.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to create route.RouteMessage: %w", err)
+	}
+	_, err = unix.Write(sock, data[:])
+	if err != nil {
+		return fmt.Errorf("failed to write route.RouteMessage to socket: %w", err)
+	}
+
+	return nil
 }

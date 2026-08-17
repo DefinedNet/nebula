@@ -5,13 +5,13 @@ package udp
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"syscall"
-
-	"github.com/sirupsen/logrus"
 )
 
-func NewListener(l *logrus.Logger, ip net.IP, port int, multi bool, batch int) (Conn, error) {
+func NewListener(l *slog.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
 	if multi {
 		//NOTE: Technically we can support it with RIO but it wouldn't be at the socket level
 		// The udp stack would need to be reworked to hide away the implementation differences between
@@ -19,13 +19,18 @@ func NewListener(l *logrus.Logger, ip net.IP, port int, multi bool, batch int) (
 		return nil, fmt.Errorf("multiple udp listeners not supported on windows")
 	}
 
+	var conn Conn
 	rc, err := NewRIOListener(l, ip, port)
 	if err == nil {
-		return rc, nil
+		conn = rc
+	} else {
+		l.Error("Falling back to standard udp sockets", "error", err)
+		conn, err = NewGenericListener(l, ip, port, multi, batch)
+		if err != nil {
+			return nil, err
+		}
 	}
-
-	l.WithError(err).Error("Falling back to standard udp sockets")
-	return NewGenericListener(l, ip, port, multi, batch)
+	return wrapWithWDFBypass(l, conn), nil
 }
 
 func NewListenConfig(multi bool) net.ListenConfig {

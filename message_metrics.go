@@ -7,14 +7,14 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-//TODO: this can probably move into the header package
-
 type MessageMetrics struct {
 	rx [][]metrics.Counter
 	tx [][]metrics.Counter
 
 	rxUnknown metrics.Counter
 	txUnknown metrics.Counter
+
+	rxInvalid metrics.Counter
 }
 
 func (m *MessageMetrics) Rx(t header.MessageType, s header.MessageSubType, i int64) {
@@ -33,6 +33,11 @@ func (m *MessageMetrics) Tx(t header.MessageType, s header.MessageSubType, i int
 		} else if m.txUnknown != nil {
 			m.txUnknown.Inc(i)
 		}
+	}
+}
+func (m *MessageMetrics) RxInvalid(i int64) {
+	if m != nil && m.rxInvalid != nil {
+		m.rxInvalid.Inc(i)
 	}
 }
 
@@ -58,6 +63,7 @@ func newMessageMetrics() *MessageMetrics {
 
 		rxUnknown: metrics.GetOrRegisterCounter("messages.rx.other", nil),
 		txUnknown: metrics.GetOrRegisterCounter("messages.tx.other", nil),
+		rxInvalid: metrics.GetOrRegisterCounter("messages.rx.invalid", nil),
 	}
 }
 

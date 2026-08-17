@@ -1,59 +1,68 @@
 package nebula
 
 import (
-	"github.com/sirupsen/logrus"
+	"context"
+	"log/slog"
+	"net/netip"
+
 	"github.com/slackhq/nebula/firewall"
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/noiseutil"
-	"github.com/slackhq/nebula/udp"
+	"github.com/slackhq/nebula/routing"
 )
 
 func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *firewall.Packet, nb, out []byte, q int, localCache firewall.ConntrackCache) {
 	err := newPacket(packet, false, fwPacket)
 	if err != nil {
-		if f.l.Level >= logrus.DebugLevel {
-			f.l.WithField("packet", packet).Debugf("Error while validating outbound packet: %s", err)
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("Error while validating outbound packet",
+				"packet", packet,
+				"error", err,
+			)
 		}
 		return
 	}
 
 	// Ignore local broadcast packets
-	if f.dropLocalBroadcast && fwPacket.RemoteIP == f.localBroadcast {
-		return
+	if f.dropLocalBroadcast {
+		if f.myBroadcastAddrsTable.Contains(fwPacket.RemoteAddr) {
+			return
+		}
 	}
 
-	if fwPacket.RemoteIP == f.myVpnIp {
+	if f.myVpnAddrsTable.Contains(fwPacket.RemoteAddr) {
 		// Immediately forward packets from self to self.
 		// This should only happen on Darwin-based and FreeBSD hosts, which
-		// routes packets from the Nebula IP to the Nebula IP through the Nebula
+		// routes packets from the Nebula addr to the Nebula addr through the Nebula
 		// TUN device.
 		if immediatelyForwardToSelf {
 			_, err := f.readers[q].Write(packet)
 			if err != nil {
-				f.l.WithError(err).Error("Failed to forward to tun")
+				f.l.Error("Failed to forward to tun", "error", err)
 			}
 		}
 		// Otherwise, drop. On linux, we should never see these packets - Linux
-		// routes packets from the nebula IP to the nebula IP through the loopback device.
+		// routes packets from the nebula addr to the nebula addr through the loopback device.
 		return
 	}
 
-	// Ignore broadcast packets
-	if f.dropMulticast && isMulticast(fwPacket.RemoteIP) {
+	// Ignore multicast packets
+	if f.dropMulticast && fwPacket.RemoteAddr.IsMulticast() {
 		return
 	}
 
-	hostinfo, ready := f.getOrHandshake(fwPacket.RemoteIP, func(hh *HandshakeHostInfo) {
+	hostinfo, ready := f.getOrHandshakeConsiderRouting(fwPacket, func(hh *HandshakeHostInfo) {
 		hh.cachePacket(f.l, header.Message, 0, packet, f.sendMessageNow, f.cachedPacketMetrics)
 	})
 
 	if hostinfo == nil {
 		f.rejectInside(packet, out, q)
-		if f.l.Level >= logrus.DebugLevel {
-			f.l.WithField("vpnIp", fwPacket.RemoteIP).
-				WithField("fwPacket", fwPacket).
-				Debugln("dropping outbound packet, vpnIp not in our CIDR or in unsafe routes")
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("dropping outbound packet, vpnAddr not in our vpn networks or in unsafe networks",
+				"vpnAddr", fwPacket.RemoteAddr,
+				"fwPacket", fwPacket,
+			)
 		}
 		return
 	}
@@ -62,23 +71,23 @@ func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *firewall.Packet
 		return
 	}
 
-	dropReason := f.firewall.Drop(packet, *fwPacket, false, hostinfo, f.pki.GetCAPool(), localCache)
+	dropReason := f.firewall.Drop(*fwPacket, false, hostinfo, f.pki.GetCAPool(), localCache)
 	if dropReason == nil {
-		f.sendNoMetrics(header.Message, 0, hostinfo.ConnectionState, hostinfo, nil, packet, nb, out, q)
+		f.sendNoMetrics(header.Message, 0, hostinfo.ConnectionState, hostinfo, netip.AddrPort{}, packet, nb, out, q)
 
 	} else {
 		f.rejectInside(packet, out, q)
-		if f.l.Level >= logrus.DebugLevel {
-			hostinfo.logger(f.l).
-				WithField("fwPacket", fwPacket).
-				WithField("reason", dropReason).
-				Debugln("dropping outbound packet")
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			hostinfo.logger(f.l).Debug("dropping outbound packet",
+				"fwPacket", fwPacket,
+				"reason", dropReason,
+			)
 		}
 	}
 }
 
 func (f *Interface) rejectInside(packet []byte, out []byte, q int) {
-	if !f.firewall.InSendReject {
+	if !f.firewall.OutboundSendReject {
 		return
 	}
 
@@ -89,12 +98,12 @@ func (f *Interface) rejectInside(packet []byte, out []byte, q int) {
 
 	_, err := f.readers[q].Write(out)
 	if err != nil {
-		f.l.WithError(err).Error("Failed to write to tun")
+		f.l.Error("Failed to write to tun", "error", err)
 	}
 }
 
 func (f *Interface) rejectOutside(packet []byte, ci *ConnectionState, hostinfo *HostInfo, nb, out []byte, q int) {
-	if !f.firewall.OutSendReject {
+	if !f.firewall.InboundSendReject {
 		return
 	}
 
@@ -104,67 +113,143 @@ func (f *Interface) rejectOutside(packet []byte, ci *ConnectionState, hostinfo *
 	}
 
 	if len(out) > iputil.MaxRejectPacketSize {
-		if f.l.GetLevel() >= logrus.InfoLevel {
-			f.l.
-				WithField("packet", packet).
-				WithField("outPacket", out).
-				Info("rejectOutside: packet too big, not sending")
+		if f.l.Enabled(context.Background(), slog.LevelInfo) {
+			f.l.Info("rejectOutside: packet too big, not sending",
+				"packet", packet,
+				"outPacket", out,
+			)
 		}
 		return
 	}
 
-	f.sendNoMetrics(header.Message, 0, ci, hostinfo, nil, out, nb, packet, q)
+	f.sendNoMetrics(header.Message, 0, ci, hostinfo, netip.AddrPort{}, out, nb, packet, q)
 }
 
-func (f *Interface) Handshake(vpnIp iputil.VpnIp) {
-	f.getOrHandshake(vpnIp, nil)
+// Handshake will attempt to initiate a tunnel with the provided vpn address. This is a no-op if the tunnel is already established or being established
+// it does not check if it is within our vpn networks!
+func (f *Interface) Handshake(vpnAddr netip.Addr) {
+	f.handshakeManager.GetOrHandshake(vpnAddr, nil)
 }
 
-// getOrHandshake returns nil if the vpnIp is not routable.
+// getOrHandshakeNoRouting returns nil if the vpnAddr is not routable.
 // If the 2nd return var is false then the hostinfo is not ready to be used in a tunnel
-func (f *Interface) getOrHandshake(vpnIp iputil.VpnIp, cacheCallback func(*HandshakeHostInfo)) (*HostInfo, bool) {
-	if !ipMaskContains(f.lightHouse.myVpnIp, f.lightHouse.myVpnZeros, vpnIp) {
-		vpnIp = f.inside.RouteFor(vpnIp)
-		if vpnIp == 0 {
-			return nil, false
-		}
+func (f *Interface) getOrHandshakeNoRouting(vpnAddr netip.Addr, cacheCallback func(*HandshakeHostInfo)) (*HostInfo, bool) {
+	if f.myVpnNetworksTable.Contains(vpnAddr) {
+		return f.handshakeManager.GetOrHandshake(vpnAddr, cacheCallback)
 	}
 
-	return f.handshakeManager.GetOrHandshake(vpnIp, cacheCallback)
+	return nil, false
+}
+
+// getOrHandshakeConsiderRouting will try to find the HostInfo to handle this packet, starting a handshake if necessary.
+// If the 2nd return var is false then the hostinfo is not ready to be used in a tunnel.
+func (f *Interface) getOrHandshakeConsiderRouting(fwPacket *firewall.Packet, cacheCallback func(*HandshakeHostInfo)) (*HostInfo, bool) {
+	destinationAddr := fwPacket.RemoteAddr
+
+	hostinfo, ready := f.getOrHandshakeNoRouting(destinationAddr, cacheCallback)
+
+	// Host is inside the mesh, no routing required
+	if hostinfo != nil {
+		return hostinfo, ready
+	}
+
+	gateways := f.inside.RoutesFor(destinationAddr)
+
+	switch len(gateways) {
+	case 0:
+		return nil, false
+	case 1:
+		// Single gateway route
+		return f.handshakeManager.GetOrHandshake(gateways[0].Addr(), cacheCallback)
+	default:
+		// Multi gateway route, perform ECMP categorization
+		gatewayAddr, balancingOk := routing.BalancePacket(fwPacket, gateways)
+
+		if !balancingOk {
+			// This happens if the gateway buckets were not calculated, this _should_ never happen
+			f.l.Error("Gateway buckets not calculated, fallback from ECMP to random routing. Please report this bug.")
+		}
+
+		var handshakeInfoForChosenGateway *HandshakeHostInfo
+		var hhReceiver = func(hh *HandshakeHostInfo) {
+			handshakeInfoForChosenGateway = hh
+		}
+
+		// Store the handshakeHostInfo for later.
+		// If this node is not reachable we will attempt other nodes, if none are reachable we will
+		// cache the packet for this gateway.
+		if hostinfo, ready = f.handshakeManager.GetOrHandshake(gatewayAddr, hhReceiver); ready {
+			return hostinfo, true
+		}
+
+		// It appears the selected gateway cannot be reached, find another gateway to fallback on.
+		// The current implementation breaks ECMP but that seems better than no connectivity.
+		// If ECMP is also required when a gateway is down then connectivity status
+		// for each gateway needs to be kept and the weights recalculated when they go up or down.
+		// This would also need to interact with unsafe_route updates through reloading the config or
+		// use of the use_system_route_table option
+
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("Calculated gateway for ECMP not available, attempting other gateways",
+				"destination", destinationAddr,
+				"originalGateway", gatewayAddr,
+			)
+		}
+
+		for i := range gateways {
+			// Skip the gateway that failed previously
+			if gateways[i].Addr() == gatewayAddr {
+				continue
+			}
+
+			// We do not need the HandshakeHostInfo since we cache the packet in the originally chosen gateway
+			if hostinfo, ready = f.handshakeManager.GetOrHandshake(gateways[i].Addr(), nil); ready {
+				return hostinfo, true
+			}
+		}
+
+		// No gateways reachable, cache the packet in the originally chosen gateway
+		cacheCallback(handshakeInfoForChosenGateway)
+		return hostinfo, false
+	}
+
 }
 
 func (f *Interface) sendMessageNow(t header.MessageType, st header.MessageSubType, hostinfo *HostInfo, p, nb, out []byte) {
 	fp := &firewall.Packet{}
 	err := newPacket(p, false, fp)
 	if err != nil {
-		f.l.Warnf("error while parsing outgoing packet for firewall check; %v", err)
+		f.l.Warn("error while parsing outgoing packet for firewall check", "error", err)
 		return
 	}
 
 	// check if packet is in outbound fw rules
-	dropReason := f.firewall.Drop(p, *fp, false, hostinfo, f.pki.GetCAPool(), nil)
+	dropReason := f.firewall.Drop(*fp, false, hostinfo, f.pki.GetCAPool(), nil)
 	if dropReason != nil {
-		if f.l.Level >= logrus.DebugLevel {
-			f.l.WithField("fwPacket", fp).
-				WithField("reason", dropReason).
-				Debugln("dropping cached packet")
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("dropping cached packet",
+				"fwPacket", fp,
+				"reason", dropReason,
+			)
 		}
 		return
 	}
 
-	f.sendNoMetrics(header.Message, st, hostinfo.ConnectionState, hostinfo, nil, p, nb, out, 0)
+	f.sendNoMetrics(header.Message, st, hostinfo.ConnectionState, hostinfo, netip.AddrPort{}, p, nb, out, 0)
 }
 
-// SendMessageToVpnIp handles real ip:port lookup and sends to the current best known address for vpnIp
-func (f *Interface) SendMessageToVpnIp(t header.MessageType, st header.MessageSubType, vpnIp iputil.VpnIp, p, nb, out []byte) {
-	hostInfo, ready := f.getOrHandshake(vpnIp, func(hh *HandshakeHostInfo) {
+// SendMessageToVpnAddr handles real addr:port lookup and sends to the current best known address for vpnAddr.
+// This function ignores myVpnNetworksTable, and will always attempt to treat the address as a vpnAddr
+func (f *Interface) SendMessageToVpnAddr(t header.MessageType, st header.MessageSubType, vpnAddr netip.Addr, p, nb, out []byte) {
+	hostInfo, ready := f.handshakeManager.GetOrHandshake(vpnAddr, func(hh *HandshakeHostInfo) {
 		hh.cachePacket(f.l, t, st, p, f.SendMessageToHostInfo, f.cachedPacketMetrics)
 	})
 
 	if hostInfo == nil {
-		if f.l.Level >= logrus.DebugLevel {
-			f.l.WithField("vpnIp", vpnIp).
-				Debugln("dropping SendMessageToVpnIp, vpnIp not in our CIDR or in unsafe routes")
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("dropping SendMessageToVpnAddr, vpnAddr not in our vpn networks or in unsafe routes",
+				"vpnAddr", vpnAddr,
+			)
 		}
 		return
 	}
@@ -182,10 +267,10 @@ func (f *Interface) SendMessageToHostInfo(t header.MessageType, st header.Messag
 
 func (f *Interface) send(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, p, nb, out []byte) {
 	f.messageMetrics.Tx(t, st, 1)
-	f.sendNoMetrics(t, st, ci, hostinfo, nil, p, nb, out, 0)
+	f.sendNoMetrics(t, st, ci, hostinfo, netip.AddrPort{}, p, nb, out, 0)
 }
 
-func (f *Interface) sendTo(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote *udp.Addr, p, nb, out []byte) {
+func (f *Interface) sendTo(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte) {
 	f.messageMetrics.Tx(t, st, 1)
 	f.sendNoMetrics(t, st, ci, hostinfo, remote, p, nb, out, 0)
 }
@@ -212,7 +297,7 @@ func (f *Interface) SendVia(via *HostInfo,
 	c := via.ConnectionState.messageCounter.Add(1)
 
 	out = header.Encode(out, header.Version, header.Message, header.MessageRelay, relay.RemoteIndex, c)
-	f.connectionManager.Out(via.localIndexId)
+	f.connectionManager.Out(via)
 
 	// Authenticate the header and payload, but do not encrypt for this message type.
 	// The payload consists of the inner, unencrypted Nebula header, as well as the end-to-end encrypted payload.
@@ -220,12 +305,12 @@ func (f *Interface) SendVia(via *HostInfo,
 		if noiseutil.EncryptLockNeeded {
 			via.ConnectionState.writeLock.Unlock()
 		}
-		via.logger(f.l).
-			WithField("outCap", cap(out)).
-			WithField("payloadLen", len(ad)).
-			WithField("headerLen", len(out)).
-			WithField("cipherOverhead", via.ConnectionState.eKey.Overhead()).
-			Error("SendVia out buffer not large enough for relay")
+		via.logger(f.l).Error("SendVia out buffer not large enough for relay",
+			"outCap", cap(out),
+			"payloadLen", len(ad),
+			"headerLen", len(out),
+			"cipherOverhead", via.ConnectionState.eKey.Overhead(),
+		)
 		return
 	}
 
@@ -245,22 +330,21 @@ func (f *Interface) SendVia(via *HostInfo,
 		via.ConnectionState.writeLock.Unlock()
 	}
 	if err != nil {
-		via.logger(f.l).WithError(err).Info("Failed to EncryptDanger in sendVia")
+		via.logger(f.l).Info("Failed to EncryptDanger in sendVia", "error", err)
 		return
 	}
-	err = f.writers[0].WriteTo(out, via.remote)
+	err = f.writers[0].WriteTo(out, via.GetRemote())
 	if err != nil {
-		via.logger(f.l).WithError(err).Info("Failed to WriteTo in sendVia")
+		via.logger(f.l).Info("Failed to WriteTo in sendVia", "error", err)
 	}
 	f.connectionManager.RelayUsed(relay.LocalIndex)
 }
 
-func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote *udp.Addr, p, nb, out []byte, q int) {
+func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote netip.AddrPort, p, nb, out []byte, q int) {
 	if ci.eKey == nil {
-		//TODO: log warning
 		return
 	}
-	useRelay := remote == nil && hostinfo.remote == nil
+	useRelay := !remote.IsValid() && !hostinfo.GetRemote().IsValid()
 	fullOut := out
 
 	if useRelay {
@@ -281,17 +365,19 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 
 	//l.WithField("trace", string(debug.Stack())).Error("out Header ", &Header{Version, t, st, 0, hostinfo.remoteIndexId, c}, p)
 	out = header.Encode(out, header.Version, t, st, hostinfo.remoteIndexId, c)
-	f.connectionManager.Out(hostinfo.localIndexId)
+	f.connectionManager.Out(hostinfo)
 
 	// Query our LH if we haven't since the last time we've been rebound, this will cause the remote to punch against
-	// all our IPs and enable a faster roaming.
+	// all our addrs and enable a faster roaming.
 	if t != header.CloseTunnel && hostinfo.lastRebindCount != f.rebindCount {
 		//NOTE: there is an update hole if a tunnel isn't used and exactly 256 rebinds occur before the tunnel is
 		// finally used again. This tunnel would eventually be torn down and recreated if this action didn't help.
-		f.lightHouse.QueryServer(hostinfo.vpnIp)
+		f.lightHouse.QueryServer(hostinfo.vpnAddrs[0])
 		hostinfo.lastRebindCount = f.rebindCount
-		if f.l.Level >= logrus.DebugLevel {
-			f.l.WithField("vpnIp", hostinfo.vpnIp).Debug("Lighthouse update triggered for punch due to rebind counter")
+		if f.l.Enabled(context.Background(), slog.LevelDebug) {
+			f.l.Debug("Lighthouse update triggered for punch due to rebind counter",
+				"vpnAddrs", hostinfo.vpnAddrs,
+			)
 		}
 	}
 
@@ -301,41 +387,44 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 		ci.writeLock.Unlock()
 	}
 	if err != nil {
-		hostinfo.logger(f.l).WithError(err).
-			WithField("udpAddr", remote).WithField("counter", c).
-			WithField("attemptedCounter", c).
-			Error("Failed to encrypt outgoing packet")
+		hostinfo.logger(f.l).Error("Failed to encrypt outgoing packet",
+			"error", err,
+			"udpAddr", remote,
+			"counter", c,
+		)
 		return
 	}
 
-	if remote != nil {
+	if remote.IsValid() {
 		err = f.writers[q].WriteTo(out, remote)
 		if err != nil {
-			hostinfo.logger(f.l).WithError(err).
-				WithField("udpAddr", remote).Error("Failed to write outgoing packet")
+			hostinfo.logger(f.l).Error("Failed to write outgoing packet",
+				"error", err,
+				"udpAddr", remote,
+			)
 		}
-	} else if hostinfo.remote != nil {
-		err = f.writers[q].WriteTo(out, hostinfo.remote)
+	} else if hr := hostinfo.GetRemote(); hr.IsValid() {
+		err = f.writers[q].WriteTo(out, hr)
 		if err != nil {
-			hostinfo.logger(f.l).WithError(err).
-				WithField("udpAddr", remote).Error("Failed to write outgoing packet")
+			hostinfo.logger(f.l).Error("Failed to write outgoing packet",
+				"error", err,
+				"udpAddr", hr,
+			)
 		}
 	} else {
 		// Try to send via a relay
 		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
-			relayHostInfo, relay, err := f.hostMap.QueryVpnIpRelayFor(hostinfo.vpnIp, relayIP)
+			relayHostInfo, relay, err := f.hostMap.QueryVpnAddrsRelayFor(hostinfo.vpnAddrs, relayIP)
 			if err != nil {
 				hostinfo.relayState.DeleteRelay(relayIP)
-				hostinfo.logger(f.l).WithField("relay", relayIP).WithError(err).Info("sendNoMetrics failed to find HostInfo")
+				hostinfo.logger(f.l).Info("sendNoMetrics failed to find HostInfo",
+					"relay", relayIP,
+					"error", err,
+				)
 				continue
 			}
 			f.SendVia(relayHostInfo, relay, out, nb, fullOut[:header.Len+len(out)], true)
 			break
 		}
 	}
-}
-
-func isMulticast(ip iputil.VpnIp) bool {
-	// Class D multicast
-	return (((ip >> 24) & 0xff) & 0xf0) == 0xe0
 }

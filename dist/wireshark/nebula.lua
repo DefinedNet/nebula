@@ -62,7 +62,7 @@ function nebula.dissector(tvbuf, pktinfo, root)
     tree:add(pf_version, tvbuf:range(0,1))
     local type = tree:add(pf_type,    tvbuf:range(0,1))
 
-    local nebula_type = bit32.band(tvbuf:range(0,1):uint(), 0x0F)
+    local nebula_type = bit.band(tvbuf:range(0,1):uint(), 0x0F)
     if nebula_type == 0 then
         local stage = tvbuf(8,8):uint64()
         tree:add(pf_subtype_handshake, tvbuf:range(1,1))
@@ -84,30 +84,24 @@ end
 
 function nebula.prefs_changed()
     if default_settings.all_ports == nebula.prefs.all_ports and default_settings.port == nebula.prefs.port then
-        -- Nothing changed, bail
         return
     end
 
-    -- Remove our old dissector
+    -- Remove all existing registrations
     DissectorTable.get("udp.port"):remove_all(nebula)
 
-    if nebula.prefs.all_ports and default_settings.all_ports ~= nebula.prefs.all_ports then
-        default_settings.all_port = nebula.prefs.all_ports
-
+    if nebula.prefs.all_ports then
+        -- Register on every port for hole punch capture
         for i=0, 65535 do
             DissectorTable.get("udp.port"):add(i, nebula)
         end
-
-        -- no need to establish again on specific ports
-        return
+    else
+        -- Register on the configured port only
+        DissectorTable.get("udp.port"):add(nebula.prefs.port, nebula)
     end
 
-
-    if default_settings.all_ports ~= nebula.prefs.all_ports then
-        -- Add our new port dissector
-        default_settings.port = nebula.prefs.port
-        DissectorTable.get("udp.port"):add(default_settings.port, nebula)
-    end
+    default_settings.all_ports = nebula.prefs.all_ports
+    default_settings.port = nebula.prefs.port
 end
 
 DissectorTable.get("udp.port"):add(default_settings.port, nebula)

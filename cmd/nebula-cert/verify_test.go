@@ -9,6 +9,7 @@ import (
 
 	"github.com/slackhq/nebula/cert"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -22,6 +23,7 @@ func Test_verifyHelp(t *testing.T) {
 	assert.Equal(
 		t,
 		"Usage of "+os.Args[0]+" verify <flags>: verifies a certificate isn't expired and was signed by a trusted authority.\n"+
+			"  Pass \"-\" to any path flag to read from stdin or write to stdout.\n"+
 			"  -ca string\n"+
 			"    \tRequired: path to a file containing one or more ca certificates\n"+
 			"  -crt string\n"+
@@ -37,105 +39,130 @@ func Test_verify(t *testing.T) {
 
 	// required args
 	assertHelpError(t, verify([]string{"-ca", "derp"}, ob, eb), "-crt is required")
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
 
 	assertHelpError(t, verify([]string{"-crt", "derp"}, ob, eb), "-ca is required")
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
 
 	// no ca at path
 	ob.Reset()
 	eb.Reset()
 	err := verify([]string{"-ca", "does_not_exist", "-crt", "does_not_exist"}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.EqualError(t, err, "error while reading ca: open does_not_exist: "+NoSuchFileError)
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.EqualError(t, err, "error while reading ca: open does_not_exist: "+NoSuchFileError)
 
 	// invalid ca at path
 	ob.Reset()
 	eb.Reset()
 	caFile, err := os.CreateTemp("", "verify-ca")
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	defer os.Remove(caFile.Name())
 
 	caFile.WriteString("-----BEGIN NOPE-----")
 	err = verify([]string{"-ca", caFile.Name(), "-crt", "does_not_exist"}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.EqualError(t, err, "error while adding ca cert to pool: input did not contain a valid PEM encoded block")
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.ErrorIs(t, err, cert.ErrInvalidPEMBlock)
 
 	// make a ca for later
 	caPub, caPriv, _ := ed25519.GenerateKey(rand.Reader)
-	ca := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:      "test-ca",
-			NotBefore: time.Now().Add(time.Hour * -1),
-			NotAfter:  time.Now().Add(time.Hour * 2),
-			PublicKey: caPub,
-			IsCA:      true,
-		},
-	}
-	ca.Sign(cert.Curve_CURVE25519, caPriv)
-	b, _ := ca.MarshalToPEM()
+	ca, _ := NewTestCaCert("test-ca", caPub, caPriv, time.Now().Add(time.Hour*-1), time.Now().Add(time.Hour*2), nil, nil, nil)
+	b, _ := ca.MarshalPEM()
 	caFile.Truncate(0)
 	caFile.Seek(0, 0)
 	caFile.Write(b)
 
 	// no crt at path
 	err = verify([]string{"-ca", caFile.Name(), "-crt", "does_not_exist"}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.EqualError(t, err, "unable to read crt; open does_not_exist: "+NoSuchFileError)
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.EqualError(t, err, "unable to read crt: open does_not_exist: "+NoSuchFileError)
 
 	// invalid crt at path
 	ob.Reset()
 	eb.Reset()
 	certFile, err := os.CreateTemp("", "verify-cert")
-	assert.Nil(t, err)
+	require.NoError(t, err)
 	defer os.Remove(certFile.Name())
 
 	certFile.WriteString("-----BEGIN NOPE-----")
 	err = verify([]string{"-ca", caFile.Name(), "-crt", certFile.Name()}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.EqualError(t, err, "error while parsing crt: input did not contain a valid PEM encoded block")
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.EqualError(t, err, "error while parsing crt: input did not contain a valid PEM encoded block")
 
 	// unverifiable cert at path
-	_, badPriv, _ := ed25519.GenerateKey(rand.Reader)
-	certPub, _ := x25519Keypair()
-	signer, _ := ca.Sha256Sum()
-	crt := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:      "test-cert",
-			NotBefore: time.Now().Add(time.Hour * -1),
-			NotAfter:  time.Now().Add(time.Hour),
-			PublicKey: certPub,
-			IsCA:      false,
-			Issuer:    signer,
-		},
+	crt, _ := NewTestCert(ca, caPriv, "test-cert", time.Now().Add(time.Hour*-1), time.Now().Add(time.Hour), nil, nil, nil)
+	// Slightly evil hack to modify the certificate after it was sealed to generate an invalid signature
+	pub := crt.PublicKey()
+	for i, _ := range pub {
+		pub[i] = 0
 	}
-
-	crt.Sign(cert.Curve_CURVE25519, badPriv)
-	b, _ = crt.MarshalToPEM()
+	b, _ = crt.MarshalPEM()
 	certFile.Truncate(0)
 	certFile.Seek(0, 0)
 	certFile.Write(b)
 
 	err = verify([]string{"-ca", caFile.Name(), "-crt", certFile.Name()}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.EqualError(t, err, "certificate signature did not match")
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.ErrorIs(t, err, cert.ErrSignatureMismatch)
 
 	// verified cert at path
-	crt.Sign(cert.Curve_CURVE25519, caPriv)
-	b, _ = crt.MarshalToPEM()
+	crt, _ = NewTestCert(ca, caPriv, "test-cert", time.Now().Add(time.Hour*-1), time.Now().Add(time.Hour), nil, nil, nil)
+	b, _ = crt.MarshalPEM()
 	certFile.Truncate(0)
 	certFile.Seek(0, 0)
 	certFile.Write(b)
 
 	err = verify([]string{"-ca", caFile.Name(), "-crt", certFile.Name()}, ob, eb)
-	assert.Equal(t, "", ob.String())
-	assert.Equal(t, "", eb.String())
-	assert.Nil(t, err)
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+	require.NoError(t, err)
+}
+
+func Test_verify_stdio(t *testing.T) {
+	ob := &bytes.Buffer{}
+	eb := &bytes.Buffer{}
+
+	caPub, caPriv, _ := ed25519.GenerateKey(rand.Reader)
+	ca, _ := NewTestCaCert("test-ca", caPub, caPriv, time.Now().Add(time.Hour*-1), time.Now().Add(time.Hour*2), nil, nil, nil)
+	caPEM, _ := ca.MarshalPEM()
+
+	crt, _ := NewTestCert(ca, caPriv, "test-cert", time.Now().Add(time.Hour*-1), time.Now().Add(time.Hour), nil, nil, nil)
+	crtPEM, _ := crt.MarshalPEM()
+
+	caFile, err := os.CreateTemp("", "verify-ca")
+	require.NoError(t, err)
+	defer os.Remove(caFile.Name())
+	caFile.Write(caPEM)
+
+	// crt on stdin, ca on disk
+	withStdin(t, bytes.NewReader(crtPEM))
+	require.NoError(t, verify([]string{"-ca", caFile.Name(), "-crt", "-"}, ob, eb))
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+
+	// ca on stdin, crt on disk
+	certFile, err := os.CreateTemp("", "verify-cert")
+	require.NoError(t, err)
+	defer os.Remove(certFile.Name())
+	certFile.Write(crtPEM)
+
+	withStdin(t, bytes.NewReader(caPEM))
+	ob.Reset()
+	eb.Reset()
+	require.NoError(t, verify([]string{"-ca", "-", "-crt", certFile.Name()}, ob, eb))
+	assert.Empty(t, ob.String())
+	assert.Empty(t, eb.String())
+
+	// both flags on stdin should error
+	withStdin(t, bytes.NewReader(caPEM))
+	ob.Reset()
+	eb.Reset()
+	require.EqualError(t, verify([]string{"-ca", "-", "-crt", "-"}, ob, eb),
+		`-ca and -crt both set to "-", only one input may read from stdin`)
 }
