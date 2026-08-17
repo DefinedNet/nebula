@@ -5,14 +5,15 @@ package udp
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"syscall"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
-func NewListener(l *logrus.Logger, ip net.IP, port int, multi bool, batch int) (Conn, error) {
+func NewListener(l *slog.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
 	return NewGenericListener(l, ip, port, multi, batch)
 }
 

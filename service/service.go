@@ -8,16 +8,14 @@ import (
 	"log"
 	"math"
 	"net"
-	"os"
+	"net/netip"
 	"strings"
 	"sync"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula"
-	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/overlay"
 	"golang.org/x/sync/errgroup"
-	"gvisor.dev/gvisor/pkg/bufferv2"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -45,15 +43,24 @@ type Service struct {
 	}
 }
 
-func New(config *config.C) (*Service, error) {
-	logger := logrus.New()
-	logger.Out = os.Stdout
+func New(control *nebula.Control) (_ *Service, reterr error) {
+	// Check this before Start so a failure doesn't leave a running nebula
+	device, ok := control.Device().(*overlay.UserDevice)
+	if !ok {
+		return nil, errors.New("must be using user device")
+	}
 
-	control, err := nebula.Main(config, false, "custom-app", logger, overlay.NewUserDeviceFromConfig)
+	err := control.Start()
 	if err != nil {
 		return nil, err
 	}
-	control.Start()
+
+	// Anything that fails after a successful Start must tear nebula back down
+	defer func() {
+		if reterr != nil {
+			control.Stop()
+		}
+	}()
 
 	ctx := control.Context()
 	eg, ctx := errgroup.WithContext(ctx)
@@ -62,11 +69,6 @@ func New(config *config.C) (*Service, error) {
 		control: control,
 	}
 	s.mu.listeners = map[uint16]*tcpListener{}
-
-	device, ok := control.Device().(*overlay.UserDevice)
-	if !ok {
-		return nil, errors.New("must be using user device")
-	}
 
 	s.ipstack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -81,7 +83,7 @@ func New(config *config.C) (*Service, error) {
 	if tcpipProblem := s.ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
 	}
-	ipv4Subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 4)), tcpip.AddressMask(strings.Repeat("\x00", 4)))
+	ipv4Subnet, _ := tcpip.NewSubnet(tcpip.AddrFrom4([4]byte{0x00, 0x00, 0x00, 0x00}), tcpip.MaskFrom(strings.Repeat("\x00", 4)))
 	s.ipstack.SetRouteTable([]tcpip.Route{
 		{
 			Destination: ipv4Subnet,
@@ -89,9 +91,9 @@ func New(config *config.C) (*Service, error) {
 		},
 	})
 
-	ipNet := device.Cidr()
+	ipNet := device.Networks()
 	pa := tcpip.ProtocolAddress{
-		AddressWithPrefix: tcpip.Address(ipNet.IP).WithPrefix(),
+		AddressWithPrefix: tcpip.AddrFromSlice(ipNet[0].Addr().AsSlice()).WithPrefix(),
 		Protocol:          ipv4.ProtocolNumber,
 	}
 	if err := s.ipstack.AddProtocolAddress(nicID, pa, stack.AddressProperties{
@@ -124,7 +126,7 @@ func New(config *config.C) (*Service, error) {
 				return err
 			}
 			packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: bufferv2.MakeWithData(bytes.Clone(buf[:n])),
+				Payload: buffer.MakeWithData(bytes.Clone(buf[:n])),
 			})
 			linkEP.InjectInbound(header.IPv4ProtocolNumber, packetBuf)
 
@@ -136,7 +138,7 @@ func New(config *config.C) (*Service, error) {
 	eg.Go(func() error {
 		for {
 			packet := linkEP.ReadContext(ctx)
-			if packet.IsNil() {
+			if packet == nil {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -150,27 +152,57 @@ func New(config *config.C) (*Service, error) {
 		}
 	})
 
+	// Add the nebula wait function to the group so a fatal reader error
+	// propagates out through errgroup.Wait().
+	eg.Go(func() error {
+		return control.Wait()
+	})
+
 	return &s, nil
 }
 
-// DialContext dials the provided address. Currently only TCP is supported.
+func getProtocolNumber(addr netip.Addr) tcpip.NetworkProtocolNumber {
+	if addr.Is6() {
+		return ipv6.ProtocolNumber
+	}
+	return ipv4.ProtocolNumber
+}
+
+// DialContext dials the provided address.
 func (s *Service) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if network != "tcp" && network != "tcp4" {
-		return nil, errors.New("only tcp is supported")
+	switch network {
+	case "udp", "udp4", "udp6":
+		addr, err := net.ResolveUDPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		fullAddr := tcpip.FullAddress{
+			NIC:  nicID,
+			Addr: tcpip.AddrFromSlice(addr.IP),
+			Port: uint16(addr.Port),
+		}
+		num := getProtocolNumber(addr.AddrPort().Addr())
+		return gonet.DialUDP(s.ipstack, nil, &fullAddr, num)
+	case "tcp", "tcp4", "tcp6":
+		addr, err := net.ResolveTCPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		fullAddr := tcpip.FullAddress{
+			NIC:  nicID,
+			Addr: tcpip.AddrFromSlice(addr.IP),
+			Port: uint16(addr.Port),
+		}
+		num := getProtocolNumber(addr.AddrPort().Addr())
+		return gonet.DialContextTCP(ctx, s.ipstack, fullAddr, num)
+	default:
+		return nil, fmt.Errorf("unknown network type: %s", network)
 	}
+}
 
-	addr, err := net.ResolveTCPAddr(network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	fullAddr := tcpip.FullAddress{
-		NIC:  nicID,
-		Addr: tcpip.Address(addr.IP),
-		Port: uint16(addr.Port),
-	}
-
-	return gonet.DialContextTCP(ctx, s.ipstack, fullAddr, ipv4.ProtocolNumber)
+// Dial dials the provided address
+func (s *Service) Dial(network, address string) (net.Conn, error) {
+	return s.DialContext(context.Background(), network, address)
 }
 
 // Listen listens on the provided address. Currently only TCP with wildcard

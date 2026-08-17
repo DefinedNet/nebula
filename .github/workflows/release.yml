@@ -10,11 +10,11 @@ jobs:
     name: Build Linux/BSD All
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.26'
           check-latest: true
 
       - name: Build
@@ -24,7 +24,7 @@ jobs:
           mv build/*.tar.gz release
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: linux-latest
           path: release
@@ -32,12 +32,15 @@ jobs:
   build-windows:
     name: Build Windows
     runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.26'
           check-latest: true
 
       - name: Build
@@ -54,8 +57,15 @@ jobs:
           mkdir build\dist\windows
           mv dist\windows\wintun build\dist\windows\
 
+      - name: Code-sign
+        uses: ./.github/actions/code-sign
+        with:
+          path: build
+          role: ${{ secrets.DEFINED_CODE_SIGNER_ROLE }}
+          bucket: ${{ secrets.DEFINED_CODE_SIGNER_BUCKET }}
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: windows-latest
           path: build
@@ -64,18 +74,18 @@ jobs:
     name: Build Universal Darwin
     env:
       HAS_SIGNING_CREDS: ${{ secrets.AC_USERNAME != '' }}
-    runs-on: macos-11
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.26'
           check-latest: true
 
       - name: Import certificates
         if: env.HAS_SIGNING_CREDS == 'true'
-        uses: Apple-Actions/import-codesign-certs@v2
+        uses: Apple-Actions/import-codesign-certs@v7
         with:
           p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_P12_BASE64 }}
           p12-password: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
@@ -104,20 +114,69 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: darwin-latest
           path: ./release/*
+
+  build-docker:
+    name: Create and Upload Docker Images
+    # Technically we only need build-linux to succeed, but if any platforms fail we'll
+    # want to investigate and restart the build
+    needs: [build-linux, build-darwin, build-windows]
+    runs-on: ubuntu-latest
+    env:
+      HAS_DOCKER_CREDS: ${{ vars.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    # XXX It's not possible to write a conditional here, so instead we do it on every step
+    #if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+    steps:
+      # Be sure to checkout the code before downloading artifacts, or they will
+      # be overwritten
+      - name: Checkout code
+        if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-latest
+          path: artifacts
+
+      - name: Login to Docker Hub
+        if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push images
+        if: ${{ env.HAS_DOCKER_CREDS == 'true' }}
+        env:
+          DOCKER_IMAGE_REPO: ${{ vars.DOCKER_IMAGE_REPO || 'nebulaoss/nebula' }}
+          DOCKER_IMAGE_TAG: ${{ vars.DOCKER_IMAGE_TAG || 'latest' }}
+        run: |
+          mkdir -p build/linux-{amd64,arm64}
+          tar -zxvf artifacts/nebula-linux-amd64.tar.gz -C build/linux-amd64/
+          tar -zxvf artifacts/nebula-linux-arm64.tar.gz -C build/linux-arm64/
+          docker buildx build . --push -f docker/Dockerfile --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="${GITHUB_REF#refs/tags/v}" \
+            --build-arg REVISION="${GITHUB_SHA}" \
+            --tag "${DOCKER_IMAGE_REPO}:${DOCKER_IMAGE_TAG}" --tag "${DOCKER_IMAGE_REPO}:${GITHUB_REF#refs/tags/v}"
 
   release:
     name: Create and Upload Release
     needs: [build-linux, build-darwin, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -163,10 +222,11 @@ jobs:
         id: create_release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           cd artifacts
           gh release create \
             --verify-tag \
-            --title "Release ${{ github.ref_name }}" \
-            "${{ github.ref_name }}" \
+            --title "Release ${GITHUB_REF_NAME}" \
+            "${GITHUB_REF_NAME}" \
             SHASUM256.txt *-latest/*.zip *-latest/*.tar.gz

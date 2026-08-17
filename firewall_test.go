@@ -2,25 +2,25 @@ package nebula
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
+	"log/slog"
 	"math"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
-	"github.com/rcrowley/go-metrics"
+	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/firewall"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewFirewall(t *testing.T) {
 	l := test.NewLogger()
-	c := &cert.NebulaCertificate{}
+	c := &dummyCert{}
 	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c)
 	conntrack := fw.Conntrack
 	assert.NotNil(t, conntrack)
@@ -58,149 +58,275 @@ func TestNewFirewall(t *testing.T) {
 }
 
 func TestFirewall_AddRule(t *testing.T) {
-	l := test.NewLogger()
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
+	l := test.NewLoggerWithOutput(ob)
 
-	c := &cert.NebulaCertificate{}
+	c := &dummyCert{}
 	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c)
 	assert.NotNil(t, fw.InRules)
 	assert.NotNil(t, fw.OutRules)
 
-	_, ti, _ := net.ParseCIDR("1.2.3.4/32")
+	ti, err := netip.ParsePrefix("1.2.3.4/32")
+	require.NoError(t, err)
 
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoTCP, 1, 1, []string{}, "", nil, nil, "", ""))
+	ti6, err := netip.ParsePrefix("fd12::34/128")
+	require.NoError(t, err)
+
+	require.NoError(t, fw.AddRule(true, firewall.ProtoTCP, 1, 1, []string{}, "", "", "", "", ""))
 	// An empty rule is any
 	assert.True(t, fw.InRules.TCP[1].Any.Any.Any)
 	assert.Empty(t, fw.InRules.TCP[1].Any.Groups)
 	assert.Empty(t, fw.InRules.TCP[1].Any.Hosts)
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", nil, nil, "", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", "", "", "", ""))
 	assert.Nil(t, fw.InRules.UDP[1].Any.Any)
 	assert.Contains(t, fw.InRules.UDP[1].Any.Groups[0].Groups, "g1")
 	assert.Empty(t, fw.InRules.UDP[1].Any.Hosts)
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoICMP, 1, 1, []string{}, "h1", nil, nil, "", ""))
-	assert.Nil(t, fw.InRules.ICMP[1].Any.Any)
-	assert.Empty(t, fw.InRules.ICMP[1].Any.Groups)
-	assert.Contains(t, fw.InRules.ICMP[1].Any.Hosts, "h1")
+	require.NoError(t, fw.AddRule(true, firewall.ProtoICMP, 1, 1, []string{}, "h1", "", "", "", ""))
+	//no matter what port is given for icmp, it should end up as "any"
+	assert.Nil(t, fw.InRules.ICMP[firewall.PortAny].Any.Any)
+	assert.Empty(t, fw.InRules.ICMP[firewall.PortAny].Any.Groups)
+	assert.Contains(t, fw.InRules.ICMP[firewall.PortAny].Any.Hosts, "h1")
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", ti, nil, "", ""))
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", ti.String(), "", "", ""))
 	assert.Nil(t, fw.OutRules.AnyProto[1].Any.Any)
-	ok, _ := fw.OutRules.AnyProto[1].Any.CIDR.GetCIDR(ti)
+	_, ok := fw.OutRules.AnyProto[1].Any.CIDR.Get(ti)
 	assert.True(t, ok)
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", nil, ti, "", ""))
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", ti6.String(), "", "", ""))
+	assert.Nil(t, fw.OutRules.AnyProto[1].Any.Any)
+	_, ok = fw.OutRules.AnyProto[1].Any.CIDR.Get(ti6)
+	assert.True(t, ok)
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", "", ti.String(), "", ""))
 	assert.NotNil(t, fw.OutRules.AnyProto[1].Any.Any)
-	ok, _ = fw.OutRules.AnyProto[1].Any.Any.LocalCIDR.GetCIDR(ti)
+	ok = fw.OutRules.AnyProto[1].Any.Any.LocalCIDR.Get(ti)
 	assert.True(t, ok)
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", nil, nil, "ca-name", ""))
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 1, 1, []string{}, "", "", ti6.String(), "", ""))
+	assert.NotNil(t, fw.OutRules.AnyProto[1].Any.Any)
+	ok = fw.OutRules.AnyProto[1].Any.Any.LocalCIDR.Get(ti6)
+	assert.True(t, ok)
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", "", "", "ca-name", ""))
 	assert.Contains(t, fw.InRules.UDP[1].CANames, "ca-name")
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", nil, nil, "", "ca-sha"))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoUDP, 1, 1, []string{"g1"}, "", "", "", "", "ca-sha"))
 	assert.Contains(t, fw.InRules.UDP[1].CAShas, "ca-sha")
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Nil(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "any", nil, nil, "", ""))
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "any", "", "", "", ""))
 	assert.True(t, fw.OutRules.AnyProto[0].Any.Any.Any)
 
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	_, anyIp, _ := net.ParseCIDR("0.0.0.0/0")
-	assert.Nil(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", anyIp, nil, "", ""))
+	anyIp, err := netip.ParsePrefix("0.0.0.0/0")
+	require.NoError(t, err)
+
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", anyIp.String(), "", "", ""))
+	assert.Nil(t, fw.OutRules.AnyProto[0].Any.Any)
+	table, ok := fw.OutRules.AnyProto[0].Any.CIDR.Lookup(netip.MustParseAddr("1.1.1.1"))
+	assert.True(t, table.Any)
+	table, ok = fw.OutRules.AnyProto[0].Any.CIDR.Lookup(netip.MustParseAddr("9::9"))
+	assert.False(t, ok)
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	anyIp6, err := netip.ParsePrefix("::/0")
+	require.NoError(t, err)
+
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", anyIp6.String(), "", "", ""))
+	assert.Nil(t, fw.OutRules.AnyProto[0].Any.Any)
+	table, ok = fw.OutRules.AnyProto[0].Any.CIDR.Lookup(netip.MustParseAddr("9::9"))
+	assert.True(t, table.Any)
+	table, ok = fw.OutRules.AnyProto[0].Any.CIDR.Lookup(netip.MustParseAddr("1.1.1.1"))
+	assert.False(t, ok)
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", "any", "", "", ""))
+	assert.True(t, fw.OutRules.AnyProto[0].Any.Any.Any)
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", "", anyIp.String(), "", ""))
+	assert.False(t, fw.OutRules.AnyProto[0].Any.Any.Any)
+	assert.True(t, fw.OutRules.AnyProto[0].Any.Any.LocalCIDR.Lookup(netip.MustParseAddr("1.1.1.1")))
+	assert.False(t, fw.OutRules.AnyProto[0].Any.Any.LocalCIDR.Lookup(netip.MustParseAddr("9::9")))
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", "", anyIp6.String(), "", ""))
+	assert.False(t, fw.OutRules.AnyProto[0].Any.Any.Any)
+	assert.True(t, fw.OutRules.AnyProto[0].Any.Any.LocalCIDR.Lookup(netip.MustParseAddr("9::9")))
+	assert.False(t, fw.OutRules.AnyProto[0].Any.Any.LocalCIDR.Lookup(netip.MustParseAddr("1.1.1.1")))
+
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
+	require.NoError(t, fw.AddRule(false, firewall.ProtoAny, 0, 0, []string{}, "", "", "any", "", ""))
 	assert.True(t, fw.OutRules.AnyProto[0].Any.Any.Any)
 
 	// Test error conditions
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c)
-	assert.Error(t, fw.AddRule(true, math.MaxUint8, 0, 0, []string{}, "", nil, nil, "", ""))
-	assert.Error(t, fw.AddRule(true, firewall.ProtoAny, 10, 0, []string{}, "", nil, nil, "", ""))
+	require.Error(t, fw.AddRule(true, math.MaxUint8, 0, 0, []string{}, "", "", "", "", ""))
+	require.Error(t, fw.AddRule(true, firewall.ProtoAny, 10, 0, []string{}, "", "", "", "", ""))
 }
 
 func TestFirewall_Drop(t *testing.T) {
-	l := test.NewLogger()
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
-
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("1.1.1.1/8"))
 	p := firewall.Packet{
-		LocalIP:    iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
-		RemoteIP:   iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
+		LocalAddr:  netip.MustParseAddr("1.2.3.4"),
+		RemoteAddr: netip.MustParseAddr("1.2.3.4"),
 		LocalPort:  10,
 		RemotePort: 90,
 		Protocol:   firewall.ProtoUDP,
 		Fragment:   false,
 	}
 
-	ipNet := net.IPNet{
-		IP:   net.IPv4(1, 2, 3, 4),
-		Mask: net.IPMask{255, 255, 255, 0},
-	}
-
-	c := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:           "host1",
-			Ips:            []*net.IPNet{&ipNet},
-			Groups:         []string{"default-group"},
-			InvertedGroups: map[string]struct{}{"default-group": {}},
-			Issuer:         "signer-shasum",
-		},
+	c := dummyCert{
+		name:     "host1",
+		networks: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/24")},
+		groups:   []string{"default-group"},
+		issuer:   "signer-shasum",
 	}
 	h := HostInfo{
 		ConnectionState: &ConnectionState{
-			peerCert: &c,
+			peerCert: &cert.CachedCertificate{
+				Certificate:    &c,
+				InvertedGroups: map[string]struct{}{"default-group": {}},
+			},
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{netip.MustParseAddr("1.2.3.4")},
 	}
-	h.CreateRemoteCIDR(&c)
+	h.buildNetworks(myVpnNetworksTable, &c)
 
 	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", nil, nil, "", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
 	cp := cert.NewCAPool()
 
 	// Drop outbound
-	assert.Equal(t, fw.Drop([]byte{}, p, false, &h, cp, nil), ErrNoMatchingRule)
+	assert.Equal(t, ErrNoMatchingRule, fw.Drop(p, false, &h, cp, nil))
 	// Allow inbound
 	resetConntrack(fw)
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
 	// Allow outbound because conntrack
-	assert.NoError(t, fw.Drop([]byte{}, p, false, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, false, &h, cp, nil))
 
 	// test remote mismatch
-	oldRemote := p.RemoteIP
-	p.RemoteIP = iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 10))
-	assert.Equal(t, fw.Drop([]byte{}, p, false, &h, cp, nil), ErrInvalidRemoteIP)
-	p.RemoteIP = oldRemote
+	oldRemote := p.RemoteAddr
+	p.RemoteAddr = netip.MustParseAddr("1.2.3.10")
+	assert.Equal(t, fw.Drop(p, false, &h, cp, nil), ErrInvalidRemoteIP)
+	p.RemoteAddr = oldRemote
 
 	// ensure signer doesn't get in the way of group checks
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", nil, nil, "", "signer-shasum"))
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", nil, nil, "", "signer-shasum-bad"))
-	assert.Equal(t, fw.Drop([]byte{}, p, true, &h, cp, nil), ErrNoMatchingRule)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "", "signer-shasum"))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "", "signer-shasum-bad"))
+	assert.Equal(t, fw.Drop(p, true, &h, cp, nil), ErrNoMatchingRule)
 
 	// test caSha doesn't drop on match
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", nil, nil, "", "signer-shasum-bad"))
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", nil, nil, "", "signer-shasum"))
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h, cp, nil))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "", "signer-shasum-bad"))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "", "signer-shasum"))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
 
 	// ensure ca name doesn't get in the way of group checks
-	cp.CAs["signer-shasum"] = &cert.NebulaCertificate{Details: cert.NebulaCertificateDetails{Name: "ca-good"}}
+	cp.CAs["signer-shasum"] = &cert.CachedCertificate{Certificate: &dummyCert{name: "ca-good"}}
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", nil, nil, "ca-good", ""))
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", nil, nil, "ca-good-bad", ""))
-	assert.Equal(t, fw.Drop([]byte{}, p, true, &h, cp, nil), ErrNoMatchingRule)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "ca-good", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "ca-good-bad", ""))
+	assert.Equal(t, fw.Drop(p, true, &h, cp, nil), ErrNoMatchingRule)
 
 	// test caName doesn't drop on match
-	cp.CAs["signer-shasum"] = &cert.NebulaCertificate{Details: cert.NebulaCertificateDetails{Name: "ca-good"}}
+	cp.CAs["signer-shasum"] = &cert.CachedCertificate{Certificate: &dummyCert{name: "ca-good"}}
 	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", nil, nil, "ca-good-bad", ""))
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", nil, nil, "ca-good", ""))
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h, cp, nil))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "ca-good-bad", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "ca-good", ""))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
+}
+
+func TestFirewall_DropV6(t *testing.T) {
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("fd00::/7"))
+
+	p := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("fd12::34"),
+		RemoteAddr: netip.MustParseAddr("fd12::34"),
+		LocalPort:  10,
+		RemotePort: 90,
+		Protocol:   firewall.ProtoUDP,
+		Fragment:   false,
+	}
+
+	c := dummyCert{
+		name:     "host1",
+		networks: []netip.Prefix{netip.MustParsePrefix("fd12::34/120")},
+		groups:   []string{"default-group"},
+		issuer:   "signer-shasum",
+	}
+	h := HostInfo{
+		ConnectionState: &ConnectionState{
+			peerCert: &cert.CachedCertificate{
+				Certificate:    &c,
+				InvertedGroups: map[string]struct{}{"default-group": {}},
+			},
+		},
+		vpnAddrs: []netip.Addr{netip.MustParseAddr("fd12::34")},
+	}
+	h.buildNetworks(myVpnNetworksTable, &c)
+
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
+	cp := cert.NewCAPool()
+
+	// Drop outbound
+	assert.Equal(t, ErrNoMatchingRule, fw.Drop(p, false, &h, cp, nil))
+	// Allow inbound
+	resetConntrack(fw)
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
+	// Allow outbound because conntrack
+	require.NoError(t, fw.Drop(p, false, &h, cp, nil))
+
+	// test remote mismatch
+	oldRemote := p.RemoteAddr
+	p.RemoteAddr = netip.MustParseAddr("fd12::56")
+	assert.Equal(t, fw.Drop(p, false, &h, cp, nil), ErrInvalidRemoteIP)
+	p.RemoteAddr = oldRemote
+
+	// ensure signer doesn't get in the way of group checks
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "", "signer-shasum"))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "", "signer-shasum-bad"))
+	assert.Equal(t, fw.Drop(p, true, &h, cp, nil), ErrNoMatchingRule)
+
+	// test caSha doesn't drop on match
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "", "signer-shasum-bad"))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "", "signer-shasum"))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
+
+	// ensure ca name doesn't get in the way of group checks
+	cp.CAs["signer-shasum"] = &cert.CachedCertificate{Certificate: &dummyCert{name: "ca-good"}}
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "ca-good", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "ca-good-bad", ""))
+	assert.Equal(t, fw.Drop(p, true, &h, cp, nil), ErrNoMatchingRule)
+
+	// test caName doesn't drop on match
+	cp.CAs["signer-shasum"] = &cert.CachedCertificate{Certificate: &dummyCert{name: "ca-good"}}
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"nope"}, "", "", "", "ca-good-bad", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group"}, "", "", "", "ca-good", ""))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
 }
 
 func BenchmarkFirewallTable_match(b *testing.B) {
@@ -209,15 +335,20 @@ func BenchmarkFirewallTable_match(b *testing.B) {
 		TCP: firewallPort{},
 	}
 
-	_, n, _ := net.ParseCIDR("172.1.1.1/32")
-	goodLocalCIDRIP := iputil.Ip2VpnIp(n.IP)
-	_ = ft.TCP.addRule(f, 10, 10, []string{"good-group"}, "good-host", n, nil, "", "")
-	_ = ft.TCP.addRule(f, 100, 100, []string{"good-group"}, "good-host", nil, n, "", "")
+	pfix := netip.MustParsePrefix("172.1.1.1/32")
+	_ = ft.TCP.addRule(f, 10, 10, []string{"good-group"}, "good-host", pfix.String(), "", "", "")
+	_ = ft.TCP.addRule(f, 100, 100, []string{"good-group"}, "good-host", "", pfix.String(), "", "")
+
+	pfix6 := netip.MustParsePrefix("fd11::11/128")
+	_ = ft.TCP.addRule(f, 10, 10, []string{"good-group"}, "good-host", pfix6.String(), "", "", "")
+	_ = ft.TCP.addRule(f, 100, 100, []string{"good-group"}, "good-host", "", pfix6.String(), "", "")
 	cp := cert.NewCAPool()
 
 	b.Run("fail on proto", func(b *testing.B) {
 		// This benchmark is showing us the cost of failing to match the protocol
-		c := &cert.NebulaCertificate{}
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{},
+		}
 		for n := 0; n < b.N; n++ {
 			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoUDP}, true, c, cp))
 		}
@@ -225,29 +356,52 @@ func BenchmarkFirewallTable_match(b *testing.B) {
 
 	b.Run("pass proto, fail on port", func(b *testing.B) {
 		// This benchmark is showing us the cost of matching a specific protocol but failing to match the port
-		c := &cert.NebulaCertificate{}
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{},
+		}
 		for n := 0; n < b.N; n++ {
 			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 1}, true, c, cp))
 		}
 	})
 
 	b.Run("pass proto, port, fail on local CIDR", func(b *testing.B) {
-		c := &cert.NebulaCertificate{}
-		ip, _, _ := net.ParseCIDR("9.254.254.254/32")
-		lip := iputil.Ip2VpnIp(ip)
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{},
+		}
+		ip := netip.MustParsePrefix("9.254.254.254/32")
 		for n := 0; n < b.N; n++ {
-			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalIP: lip}, true, c, cp))
+			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: ip.Addr()}, true, c, cp))
+		}
+	})
+	b.Run("pass proto, port, fail on local CIDRv6", func(b *testing.B) {
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{},
+		}
+		ip := netip.MustParsePrefix("fd99::99/128")
+		for n := 0; n < b.N; n++ {
+			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: ip.Addr()}, true, c, cp))
 		}
 	})
 
 	b.Run("pass proto, port, any local CIDR, fail all group, name, and cidr", func(b *testing.B) {
-		_, ip, _ := net.ParseCIDR("9.254.254.254/32")
-		c := &cert.NebulaCertificate{
-			Details: cert.NebulaCertificateDetails{
-				InvertedGroups: map[string]struct{}{"nope": {}},
-				Name:           "nope",
-				Ips:            []*net.IPNet{ip},
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name:     "nope",
+				networks: []netip.Prefix{netip.MustParsePrefix("9.254.254.245/32")},
 			},
+			InvertedGroups: map[string]struct{}{"nope": {}},
+		}
+		for n := 0; n < b.N; n++ {
+			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10}, true, c, cp))
+		}
+	})
+	b.Run("pass proto, port, any local CIDRv6, fail all group, name, and cidr", func(b *testing.B) {
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name:     "nope",
+				networks: []netip.Prefix{netip.MustParsePrefix("fd99::99/128")},
+			},
+			InvertedGroups: map[string]struct{}{"nope": {}},
 		}
 		for n := 0; n < b.N; n++ {
 			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10}, true, c, cp))
@@ -255,25 +409,36 @@ func BenchmarkFirewallTable_match(b *testing.B) {
 	})
 
 	b.Run("pass proto, port, specific local CIDR, fail all group, name, and cidr", func(b *testing.B) {
-		_, ip, _ := net.ParseCIDR("9.254.254.254/32")
-		c := &cert.NebulaCertificate{
-			Details: cert.NebulaCertificateDetails{
-				InvertedGroups: map[string]struct{}{"nope": {}},
-				Name:           "nope",
-				Ips:            []*net.IPNet{ip},
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name:     "nope",
+				networks: []netip.Prefix{netip.MustParsePrefix("9.254.254.245/32")},
 			},
+			InvertedGroups: map[string]struct{}{"nope": {}},
 		}
 		for n := 0; n < b.N; n++ {
-			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalIP: goodLocalCIDRIP}, true, c, cp))
+			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: pfix.Addr()}, true, c, cp))
+		}
+	})
+	b.Run("pass proto, port, specific local CIDRv6, fail all group, name, and cidr", func(b *testing.B) {
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name:     "nope",
+				networks: []netip.Prefix{netip.MustParsePrefix("fd99::99/128")},
+			},
+			InvertedGroups: map[string]struct{}{"nope": {}},
+		}
+		for n := 0; n < b.N; n++ {
+			assert.False(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: pfix6.Addr()}, true, c, cp))
 		}
 	})
 
 	b.Run("pass on group on any local cidr", func(b *testing.B) {
-		c := &cert.NebulaCertificate{
-			Details: cert.NebulaCertificateDetails{
-				InvertedGroups: map[string]struct{}{"good-group": {}},
-				Name:           "nope",
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name: "nope",
 			},
+			InvertedGroups: map[string]struct{}{"good-group": {}},
 		}
 		for n := 0; n < b.N; n++ {
 			assert.True(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10}, true, c, cp))
@@ -281,294 +446,627 @@ func BenchmarkFirewallTable_match(b *testing.B) {
 	})
 
 	b.Run("pass on group on specific local cidr", func(b *testing.B) {
-		c := &cert.NebulaCertificate{
-			Details: cert.NebulaCertificateDetails{
-				InvertedGroups: map[string]struct{}{"good-group": {}},
-				Name:           "nope",
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name: "nope",
 			},
+			InvertedGroups: map[string]struct{}{"good-group": {}},
 		}
 		for n := 0; n < b.N; n++ {
-			assert.True(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalIP: goodLocalCIDRIP}, true, c, cp))
+			assert.True(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: pfix.Addr()}, true, c, cp))
+		}
+	})
+	b.Run("pass on group on specific local cidr6", func(b *testing.B) {
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name: "nope",
+			},
+			InvertedGroups: map[string]struct{}{"good-group": {}},
+		}
+		for n := 0; n < b.N; n++ {
+			assert.True(b, ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalAddr: pfix6.Addr()}, true, c, cp))
 		}
 	})
 
 	b.Run("pass on name", func(b *testing.B) {
-		c := &cert.NebulaCertificate{
-			Details: cert.NebulaCertificateDetails{
-				InvertedGroups: map[string]struct{}{"nope": {}},
-				Name:           "good-host",
+		c := &cert.CachedCertificate{
+			Certificate: &dummyCert{
+				name: "good-host",
 			},
+			InvertedGroups: map[string]struct{}{"nope": {}},
 		}
 		for n := 0; n < b.N; n++ {
 			ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10}, true, c, cp)
 		}
 	})
-	//
-	//b.Run("pass on ip", func(b *testing.B) {
-	//	ip := iputil.Ip2VpnIp(net.IPv4(172, 1, 1, 1))
-	//	c := &cert.NebulaCertificate{
-	//		Details: cert.NebulaCertificateDetails{
-	//			InvertedGroups: map[string]struct{}{"nope": {}},
-	//			Name:           "good-host",
-	//		},
-	//	}
-	//	for n := 0; n < b.N; n++ {
-	//		ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10, RemoteIP: ip}, true, c, cp)
-	//	}
-	//})
-	//
-	//b.Run("pass on local ip", func(b *testing.B) {
-	//	ip := iputil.Ip2VpnIp(net.IPv4(172, 1, 1, 1))
-	//	c := &cert.NebulaCertificate{
-	//		Details: cert.NebulaCertificateDetails{
-	//			InvertedGroups: map[string]struct{}{"nope": {}},
-	//			Name:           "good-host",
-	//		},
-	//	}
-	//	for n := 0; n < b.N; n++ {
-	//		ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 10, LocalIP: ip}, true, c, cp)
-	//	}
-	//})
-	//
-	//_ = ft.TCP.addRule(0, 0, []string{"good-group"}, "good-host", n, n, "", "")
-	//
-	//b.Run("pass on ip with any port", func(b *testing.B) {
-	//	ip := iputil.Ip2VpnIp(net.IPv4(172, 1, 1, 1))
-	//	c := &cert.NebulaCertificate{
-	//		Details: cert.NebulaCertificateDetails{
-	//			InvertedGroups: map[string]struct{}{"nope": {}},
-	//			Name:           "good-host",
-	//		},
-	//	}
-	//	for n := 0; n < b.N; n++ {
-	//		ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, RemoteIP: ip}, true, c, cp)
-	//	}
-	//})
-	//
-	//b.Run("pass on local ip with any port", func(b *testing.B) {
-	//	ip := iputil.Ip2VpnIp(net.IPv4(172, 1, 1, 1))
-	//	c := &cert.NebulaCertificate{
-	//		Details: cert.NebulaCertificateDetails{
-	//			InvertedGroups: map[string]struct{}{"nope": {}},
-	//			Name:           "good-host",
-	//		},
-	//	}
-	//	for n := 0; n < b.N; n++ {
-	//		ft.match(firewall.Packet{Protocol: firewall.ProtoTCP, LocalPort: 100, LocalIP: ip}, true, c, cp)
-	//	}
-	//})
 }
 
 func TestFirewall_Drop2(t *testing.T) {
-	l := test.NewLogger()
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("1.1.1.1/8"))
 
 	p := firewall.Packet{
-		LocalIP:    iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
-		RemoteIP:   iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
+		LocalAddr:  netip.MustParseAddr("1.2.3.4"),
+		RemoteAddr: netip.MustParseAddr("1.2.3.4"),
 		LocalPort:  10,
 		RemotePort: 90,
 		Protocol:   firewall.ProtoUDP,
 		Fragment:   false,
 	}
 
-	ipNet := net.IPNet{
-		IP:   net.IPv4(1, 2, 3, 4),
-		Mask: net.IPMask{255, 255, 255, 0},
-	}
+	network := netip.MustParsePrefix("1.2.3.4/24")
 
-	c := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:           "host1",
-			Ips:            []*net.IPNet{&ipNet},
-			InvertedGroups: map[string]struct{}{"default-group": {}, "test-group": {}},
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host1",
+			networks: []netip.Prefix{network},
 		},
+		InvertedGroups: map[string]struct{}{"default-group": {}, "test-group": {}},
 	}
 	h := HostInfo{
 		ConnectionState: &ConnectionState{
 			peerCert: &c,
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{network.Addr()},
 	}
-	h.CreateRemoteCIDR(&c)
+	h.buildNetworks(myVpnNetworksTable, c.Certificate)
 
-	c1 := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:           "host1",
-			Ips:            []*net.IPNet{&ipNet},
-			InvertedGroups: map[string]struct{}{"default-group": {}, "test-group-not": {}},
+	c1 := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host1",
+			networks: []netip.Prefix{network},
 		},
+		InvertedGroups: map[string]struct{}{"default-group": {}, "test-group-not": {}},
 	}
 	h1 := HostInfo{
+		vpnAddrs: []netip.Addr{network.Addr()},
 		ConnectionState: &ConnectionState{
 			peerCert: &c1,
 		},
 	}
-	h1.CreateRemoteCIDR(&c1)
+	h1.buildNetworks(myVpnNetworksTable, c1.Certificate)
 
-	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group", "test-group"}, "", nil, nil, "", ""))
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"default-group", "test-group"}, "", "", "", "", ""))
 	cp := cert.NewCAPool()
 
 	// h1/c1 lacks the proper groups
-	assert.Error(t, fw.Drop([]byte{}, p, true, &h1, cp, nil), ErrNoMatchingRule)
+	require.ErrorIs(t, fw.Drop(p, true, &h1, cp, nil), ErrNoMatchingRule)
 	// c has the proper groups
 	resetConntrack(fw)
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
 }
 
 func TestFirewall_Drop3(t *testing.T) {
-	l := test.NewLogger()
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("1.1.1.1/8"))
 
 	p := firewall.Packet{
-		LocalIP:    iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
-		RemoteIP:   iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
+		LocalAddr:  netip.MustParseAddr("1.2.3.4"),
+		RemoteAddr: netip.MustParseAddr("1.2.3.4"),
 		LocalPort:  1,
 		RemotePort: 1,
 		Protocol:   firewall.ProtoUDP,
 		Fragment:   false,
 	}
 
-	ipNet := net.IPNet{
-		IP:   net.IPv4(1, 2, 3, 4),
-		Mask: net.IPMask{255, 255, 255, 0},
-	}
-
-	c := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name: "host-owner",
-			Ips:  []*net.IPNet{&ipNet},
+	network := netip.MustParsePrefix("1.2.3.4/24")
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host-owner",
+			networks: []netip.Prefix{network},
 		},
 	}
 
-	c1 := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:   "host1",
-			Ips:    []*net.IPNet{&ipNet},
-			Issuer: "signer-sha-bad",
+	c1 := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host1",
+			networks: []netip.Prefix{network},
+			issuer:   "signer-sha-bad",
 		},
 	}
 	h1 := HostInfo{
 		ConnectionState: &ConnectionState{
 			peerCert: &c1,
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{network.Addr()},
 	}
-	h1.CreateRemoteCIDR(&c1)
+	h1.buildNetworks(myVpnNetworksTable, c1.Certificate)
 
-	c2 := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:   "host2",
-			Ips:    []*net.IPNet{&ipNet},
-			Issuer: "signer-sha",
+	c2 := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host2",
+			networks: []netip.Prefix{network},
+			issuer:   "signer-sha",
 		},
 	}
 	h2 := HostInfo{
 		ConnectionState: &ConnectionState{
 			peerCert: &c2,
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{network.Addr()},
 	}
-	h2.CreateRemoteCIDR(&c2)
+	h2.buildNetworks(myVpnNetworksTable, c2.Certificate)
 
-	c3 := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:   "host3",
-			Ips:    []*net.IPNet{&ipNet},
-			Issuer: "signer-sha-bad",
+	c3 := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host3",
+			networks: []netip.Prefix{network},
+			issuer:   "signer-sha-bad",
 		},
 	}
 	h3 := HostInfo{
 		ConnectionState: &ConnectionState{
 			peerCert: &c3,
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{network.Addr()},
 	}
-	h3.CreateRemoteCIDR(&c3)
+	h3.buildNetworks(myVpnNetworksTable, c3.Certificate)
 
-	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "host1", nil, nil, "", ""))
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "", nil, nil, "", "signer-sha"))
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "host1", "", "", "", ""))
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "", "", "", "", "signer-sha"))
 	cp := cert.NewCAPool()
 
 	// c1 should pass because host match
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h1, cp, nil))
+	require.NoError(t, fw.Drop(p, true, &h1, cp, nil))
 	// c2 should pass because ca sha match
 	resetConntrack(fw)
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h2, cp, nil))
+	require.NoError(t, fw.Drop(p, true, &h2, cp, nil))
 	// c3 should fail because no match
 	resetConntrack(fw)
-	assert.Equal(t, fw.Drop([]byte{}, p, true, &h3, cp, nil), ErrNoMatchingRule)
+	assert.Equal(t, fw.Drop(p, true, &h3, cp, nil), ErrNoMatchingRule)
+
+	// Test a remote address match
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "", "1.2.3.4/24", "", "", ""))
+	require.NoError(t, fw.Drop(p, true, &h1, cp, nil))
 }
 
-func TestFirewall_DropConntrackReload(t *testing.T) {
-	l := test.NewLogger()
+func TestFirewall_Drop3V6(t *testing.T) {
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("fd00::/7"))
 
 	p := firewall.Packet{
-		LocalIP:    iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
-		RemoteIP:   iputil.Ip2VpnIp(net.IPv4(1, 2, 3, 4)),
-		LocalPort:  10,
-		RemotePort: 90,
+		LocalAddr:  netip.MustParseAddr("fd12::34"),
+		RemoteAddr: netip.MustParseAddr("fd12::34"),
+		LocalPort:  1,
+		RemotePort: 1,
 		Protocol:   firewall.ProtoUDP,
 		Fragment:   false,
 	}
 
-	ipNet := net.IPNet{
-		IP:   net.IPv4(1, 2, 3, 4),
-		Mask: net.IPMask{255, 255, 255, 0},
-	}
-
-	c := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:           "host1",
-			Ips:            []*net.IPNet{&ipNet},
-			Groups:         []string{"default-group"},
-			InvertedGroups: map[string]struct{}{"default-group": {}},
-			Issuer:         "signer-shasum",
+	network := netip.MustParsePrefix("fd12::34/120")
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host-owner",
+			networks: []netip.Prefix{network},
 		},
 	}
 	h := HostInfo{
 		ConnectionState: &ConnectionState{
 			peerCert: &c,
 		},
-		vpnIp: iputil.Ip2VpnIp(ipNet.IP),
+		vpnAddrs: []netip.Addr{network.Addr()},
 	}
-	h.CreateRemoteCIDR(&c)
+	h.buildNetworks(myVpnNetworksTable, c.Certificate)
 
-	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", nil, nil, "", ""))
+	// Test a remote address match
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	cp := cert.NewCAPool()
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "", "fd12::34/120", "", "", ""))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
+}
+
+func TestFirewall_DropConntrackReload(t *testing.T) {
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("1.1.1.1/8"))
+
+	p := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("1.2.3.4"),
+		RemoteAddr: netip.MustParseAddr("1.2.3.4"),
+		LocalPort:  10,
+		RemotePort: 90,
+		Protocol:   firewall.ProtoUDP,
+		Fragment:   false,
+	}
+	network := netip.MustParsePrefix("1.2.3.4/24")
+
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host1",
+			networks: []netip.Prefix{network},
+			groups:   []string{"default-group"},
+			issuer:   "signer-shasum",
+		},
+		InvertedGroups: map[string]struct{}{"default-group": {}},
+	}
+	h := HostInfo{
+		ConnectionState: &ConnectionState{
+			peerCert: &c,
+		},
+		vpnAddrs: []netip.Addr{network.Addr()},
+	}
+	h.buildNetworks(myVpnNetworksTable, c.Certificate)
+
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
 	cp := cert.NewCAPool()
 
 	// Drop outbound
-	assert.Equal(t, fw.Drop([]byte{}, p, false, &h, cp, nil), ErrNoMatchingRule)
+	assert.Equal(t, fw.Drop(p, false, &h, cp, nil), ErrNoMatchingRule)
 	// Allow inbound
 	resetConntrack(fw)
-	assert.NoError(t, fw.Drop([]byte{}, p, true, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, true, &h, cp, nil))
 	// Allow outbound because conntrack
-	assert.NoError(t, fw.Drop([]byte{}, p, false, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, false, &h, cp, nil))
 
 	oldFw := fw
-	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 10, 10, []string{"any"}, "", nil, nil, "", ""))
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 10, 10, []string{"any"}, "", "", "", "", ""))
 	fw.Conntrack = oldFw.Conntrack
 	fw.rulesVersion = oldFw.rulesVersion + 1
 
 	// Allow outbound because conntrack and new rules allow port 10
-	assert.NoError(t, fw.Drop([]byte{}, p, false, &h, cp, nil))
+	require.NoError(t, fw.Drop(p, false, &h, cp, nil))
 
 	oldFw = fw
-	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
-	assert.Nil(t, fw.AddRule(true, firewall.ProtoAny, 11, 11, []string{"any"}, "", nil, nil, "", ""))
+	fw = NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 11, 11, []string{"any"}, "", "", "", "", ""))
 	fw.Conntrack = oldFw.Conntrack
 	fw.rulesVersion = oldFw.rulesVersion + 1
 
 	// Drop outbound because conntrack doesn't match new ruleset
-	assert.Equal(t, fw.Drop([]byte{}, p, false, &h, cp, nil), ErrNoMatchingRule)
+	assert.Equal(t, fw.Drop(p, false, &h, cp, nil), ErrNoMatchingRule)
+}
+
+func TestFirewall_ICMPPortBehavior(t *testing.T) {
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("1.1.1.1/8"))
+
+	network := netip.MustParsePrefix("1.2.3.4/24")
+
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host1",
+			networks: []netip.Prefix{network},
+			groups:   []string{"default-group"},
+			issuer:   "signer-shasum",
+		},
+		InvertedGroups: map[string]struct{}{"default-group": {}},
+	}
+	h := HostInfo{
+		ConnectionState: &ConnectionState{
+			peerCert: &c,
+		},
+		vpnAddrs: []netip.Addr{network.Addr()},
+	}
+	h.buildNetworks(myVpnNetworksTable, c.Certificate)
+
+	cp := cert.NewCAPool()
+
+	templ := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("1.2.3.4"),
+		RemoteAddr: netip.MustParseAddr("1.2.3.4"),
+		Protocol:   firewall.ProtoICMP,
+		Fragment:   false,
+	}
+
+	t.Run("ICMP allowed", func(t *testing.T) {
+		fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+		require.NoError(t, fw.AddRule(true, firewall.ProtoICMP, 0, 0, []string{"any"}, "", "", "", "", ""))
+		t.Run("zero ports", func(t *testing.T) {
+			p := templ.Copy()
+			p.LocalPort = 0
+			p.RemotePort = 0
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			require.NoError(t, fw.Drop(*p, true, &h, cp, nil))
+			//now also allow outbound
+			require.NoError(t, fw.Drop(*p, false, &h, cp, nil))
+		})
+
+		t.Run("nonzero ports", func(t *testing.T) {
+			p := templ.Copy()
+			p.LocalPort = 0xabcd
+			p.RemotePort = 0x1234
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			require.NoError(t, fw.Drop(*p, true, &h, cp, nil))
+			//now also allow outbound
+			require.NoError(t, fw.Drop(*p, false, &h, cp, nil))
+		})
+	})
+
+	t.Run("Any proto, some ports allowed", func(t *testing.T) {
+		fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+		require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 80, 444, []string{"any"}, "", "", "", "", ""))
+		t.Run("zero ports, still blocked", func(t *testing.T) {
+			p := templ.Copy()
+			p.LocalPort = 0
+			p.RemotePort = 0
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			assert.Equal(t, fw.Drop(*p, true, &h, cp, nil), ErrNoMatchingRule)
+			//now also allow outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+		})
+
+		t.Run("nonzero ports, still blocked", func(t *testing.T) {
+			p := templ.Copy()
+			p.LocalPort = 0xabcd
+			p.RemotePort = 0x1234
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			assert.Equal(t, fw.Drop(*p, true, &h, cp, nil), ErrNoMatchingRule)
+			//now also allow outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+		})
+
+		t.Run("nonzero, matching ports, still blocked", func(t *testing.T) {
+			p := templ.Copy()
+			p.LocalPort = 80
+			p.RemotePort = 80
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			assert.Equal(t, fw.Drop(*p, true, &h, cp, nil), ErrNoMatchingRule)
+			//now also allow outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+		})
+	})
+	t.Run("Any proto, any port", func(t *testing.T) {
+		fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+		require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
+		t.Run("zero ports, allowed", func(t *testing.T) {
+			resetConntrack(fw)
+			p := templ.Copy()
+			p.LocalPort = 0
+			p.RemotePort = 0
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			require.NoError(t, fw.Drop(*p, true, &h, cp, nil))
+			//now also allow outbound
+			require.NoError(t, fw.Drop(*p, false, &h, cp, nil))
+		})
+
+		t.Run("nonzero ports, allowed", func(t *testing.T) {
+			resetConntrack(fw)
+			p := templ.Copy()
+			p.LocalPort = 0xabcd
+			p.RemotePort = 0x1234
+			// Drop outbound
+			assert.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+			// Allow inbound
+			resetConntrack(fw)
+			require.NoError(t, fw.Drop(*p, true, &h, cp, nil))
+			//now also allow outbound
+			require.NoError(t, fw.Drop(*p, false, &h, cp, nil))
+			//different ID is blocked
+			p.RemotePort++
+			require.Equal(t, fw.Drop(*p, false, &h, cp, nil), ErrNoMatchingRule)
+		})
+	})
+
+}
+
+func TestFirewall_DropIPSpoofing(t *testing.T) {
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("192.0.2.1/24"))
+
+	c := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "host-owner",
+			networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
+		},
+	}
+
+	c1 := cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:           "host",
+			networks:       []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")},
+			unsafeNetworks: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		},
+	}
+	h1 := HostInfo{
+		ConnectionState: &ConnectionState{
+			peerCert: &c1,
+		},
+		vpnAddrs: []netip.Addr{c1.Certificate.Networks()[0].Addr()},
+	}
+	h1.buildNetworks(myVpnNetworksTable, c1.Certificate)
+
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, c.Certificate)
+
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 1, 1, []string{}, "", "", "", "", ""))
+	cp := cert.NewCAPool()
+
+	// Packet spoofed by `c1`. Note that the remote addr is not a valid one.
+	p := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("192.0.2.1"),
+		RemoteAddr: netip.MustParseAddr("192.0.2.3"),
+		LocalPort:  1,
+		RemotePort: 1,
+		Protocol:   firewall.ProtoUDP,
+		Fragment:   false,
+	}
+	assert.Equal(t, fw.Drop(p, true, &h1, cp, nil), ErrInvalidRemoteIP)
+}
+
+func TestFirewall_ConntrackSourceSpoofingAcrossPeers(t *testing.T) {
+	l := test.NewLoggerWithOutput(&bytes.Buffer{})
+
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("192.0.2.1/24"))
+
+	owner := &dummyCert{
+		name:     "owner",
+		networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
+	}
+
+	victim := &cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "victim",
+			networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")},
+		},
+	}
+	victimHI := HostInfo{
+		ConnectionState: &ConnectionState{peerCert: victim},
+		vpnAddrs:        []netip.Addr{netip.MustParseAddr("192.0.2.2")},
+	}
+	victimHI.buildNetworks(myVpnNetworksTable, victim.Certificate)
+
+	attacker := &cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "attacker",
+			networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.3/24")},
+		},
+	}
+	attackerHI := HostInfo{
+		ConnectionState: &ConnectionState{peerCert: attacker},
+		vpnAddrs:        []netip.Addr{netip.MustParseAddr("192.0.2.3")},
+	}
+	attackerHI.buildNetworks(myVpnNetworksTable, attacker.Certificate)
+
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, owner)
+	// Allow any inbound traffic that passes the cert / source-IP checks.
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
+	cp := cert.NewCAPool()
+
+	flow := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("192.0.2.1"),
+		RemoteAddr: netip.MustParseAddr("192.0.2.2"),
+		LocalPort:  443,
+		RemotePort: 55000,
+		Protocol:   firewall.ProtoUDP,
+	}
+
+	require.NoError(t, fw.Drop(flow, true, &victimHI, cp, nil),
+		"victim's own traffic from its own overlay IP must be allowed")
+
+	unseen := flow
+	unseen.RemotePort = 55001
+	assert.Equal(t, ErrInvalidRemoteIP, fw.Drop(unseen, true, &attackerHI, cp, nil),
+		"sanity: attacker forging victim's source IP must be rejected when no conntrack entry exists")
+
+	got := fw.Drop(flow, true, &attackerHI, cp, nil)
+	t.Logf("attacker replaying victim's 4-tuple: Drop returned %v (nil == packet ALLOWED == spoof succeeded)", got)
+	assert.Equal(t, ErrInvalidRemoteIP, got,
+		"SECURITY: attacker spoofed victim's overlay source IP (192.0.2.2) by reusing an existing conntrack 4-tuple; Drop returned %v instead of rejecting", got)
+}
+
+// BenchmarkFirewallDropConntrackHit measures Drop on an already-established flow
+// (a conntrack hit). This is the fast path that the source-IP<->cert binding
+// reordering adds work to, so it quantifies the cost of moving the address checks
+// ahead of the conntrack lookup. Cases:
+//   - simple:  peer cert has one address, no unsafe networks (h.networks == nil),
+//     so the remote-address check is a single netip.Addr compare.
+//   - complex: peer cert has unsafe networks (h.networks populated), so the
+//     remote-address check is a BART lookup.
+//   - noCache/localCache: whether a per-batch ConntrackCache is supplied, which in
+//     the original code let the fast path skip straight past the address checks.
+func BenchmarkFirewallDropConntrackHit(b *testing.B) {
+	l := test.NewLoggerWithOutput(&bytes.Buffer{})
+
+	myVpnNetworksTable := new(bart.Lite)
+	myVpnNetworksTable.Insert(netip.MustParsePrefix("192.0.2.1/24"))
+
+	owner := &dummyCert{
+		name:     "owner",
+		networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
+	}
+
+	simpleCert := &cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:     "simple",
+			networks: []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")},
+		},
+	}
+	simpleHost := &HostInfo{
+		ConnectionState: &ConnectionState{peerCert: simpleCert},
+		vpnAddrs:        []netip.Addr{netip.MustParseAddr("192.0.2.2")},
+	}
+	simpleHost.buildNetworks(myVpnNetworksTable, simpleCert.Certificate)
+
+	complexCert := &cert.CachedCertificate{
+		Certificate: &dummyCert{
+			name:           "complex",
+			networks:       []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")},
+			unsafeNetworks: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+		},
+	}
+	complexHost := &HostInfo{
+		ConnectionState: &ConnectionState{peerCert: complexCert},
+		vpnAddrs:        []netip.Addr{netip.MustParseAddr("192.0.2.2")},
+	}
+	complexHost.buildNetworks(myVpnNetworksTable, complexCert.Certificate)
+
+	cp := cert.NewCAPool()
+
+	flow := firewall.Packet{
+		LocalAddr:  netip.MustParseAddr("192.0.2.1"),
+		RemoteAddr: netip.MustParseAddr("192.0.2.2"),
+		LocalPort:  443,
+		RemotePort: 55000,
+		Protocol:   firewall.ProtoUDP,
+	}
+
+	cases := []struct {
+		name     string
+		host     *HostInfo
+		useCache bool
+	}{
+		{"simple/noCache", simpleHost, false},
+		{"simple/localCache", simpleHost, true},
+		{"complex/noCache", complexHost, false},
+		{"complex/localCache", complexHost, true},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			fw := NewFirewall(l, time.Second, time.Minute, time.Hour, owner)
+			require.NoError(b, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
+
+			// Establish the conntrack entry so every benchmarked Drop is a hit.
+			require.NoError(b, fw.Drop(flow, true, tc.host, cp, nil))
+
+			var cache firewall.ConntrackCache
+			if tc.useCache {
+				cache = firewall.ConntrackCache{}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := fw.Drop(flow, true, tc.host, cp, cache); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func BenchmarkLookup(b *testing.B) {
@@ -642,319 +1140,566 @@ func BenchmarkLookup(b *testing.B) {
 			ml(m, a)
 		}
 	})
-
-	//TODO: only way array lookup in array will help is if both are sorted, then maybe it's faster
 }
 
 func Test_parsePort(t *testing.T) {
 	_, _, err := parsePort("")
-	assert.EqualError(t, err, "was not a number; ``")
+	require.EqualError(t, err, "was not a number; ``")
 
 	_, _, err = parsePort("  ")
-	assert.EqualError(t, err, "was not a number; `  `")
+	require.EqualError(t, err, "was not a number; `  `")
 
 	_, _, err = parsePort("-")
-	assert.EqualError(t, err, "appears to be a range but could not be parsed; `-`")
+	require.EqualError(t, err, "appears to be a range but could not be parsed; `-`")
 
 	_, _, err = parsePort(" - ")
-	assert.EqualError(t, err, "appears to be a range but could not be parsed; ` - `")
+	require.EqualError(t, err, "appears to be a range but could not be parsed; ` - `")
 
 	_, _, err = parsePort("a-b")
-	assert.EqualError(t, err, "beginning range was not a number; `a`")
+	require.EqualError(t, err, "beginning range was not a number; `a`")
 
 	_, _, err = parsePort("1-b")
-	assert.EqualError(t, err, "ending range was not a number; `b`")
+	require.EqualError(t, err, "ending range was not a number; `b`")
 
 	s, e, err := parsePort(" 1 - 2    ")
 	assert.Equal(t, int32(1), s)
 	assert.Equal(t, int32(2), e)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	s, e, err = parsePort("0-1")
 	assert.Equal(t, int32(0), s)
 	assert.Equal(t, int32(0), e)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	s, e, err = parsePort("9919")
 	assert.Equal(t, int32(9919), s)
 	assert.Equal(t, int32(9919), e)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	s, e, err = parsePort("any")
 	assert.Equal(t, int32(0), s)
 	assert.Equal(t, int32(0), e)
-	assert.Nil(t, err)
+	require.NoError(t, err)
+}
+
+// Test_parsePort_invalid covers inputs that must error. The named bug is
+// that int32(strconv.Atoi("4294967296")) truncates to 0 == firewall.PortAny,
+// silently turning a typo into a match-all-ports rule; the rest are
+// representative syntax/range probes.
+func Test_parsePort_invalid(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           string
+		wantErrContains string
+	}{
+		// Numeric overflow (the named bug + boundary).
+		{"named bug: 2^32 truncates to PortAny", "4294967296", "out of range"},
+		{"just above max real port", "65536", "out of range"},
+
+		// Negatives route through the range branch and hit the empty-half
+		// guard; included as defense in depth so a future refactor cannot
+		// accidentally reach the int32 cast.
+		{"negative", "-1", "could not be parsed"},
+
+		// Syntax probes.
+		{"NUL between digits", "4\x002", "was not a number"},
+		{"hex notation", "0x10", "was not a number"},
+		{"scientific notation", "1e3", "was not a number"},
+		{"leading whitespace", " 42", "was not a number"},
+		{"fullwidth digits", "４２", "was not a number"},
+
+		// Range branch.
+		{"range upper out of range", "1-65536", "ending range out of range"},
+		{"range lower out of range", "65536-65537", "beginning range out of range"},
+		{"range with negative upper", "1--1", "ending range was not a number"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := parsePort(tc.input)
+			require.Error(t, err, "input %q must error", tc.input)
+			require.ErrorContains(t, err, tc.wantErrContains)
+		})
+	}
+}
+
+// Test_parsePort_valid_boundaries locks in success cases at 0, 1, and 65535
+// so a future refactor cannot regress the boundaries.
+func Test_parsePort_valid_boundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantStart int32
+		wantEnd   int32
+	}{
+		{"zero is PortAny", "0", 0, 0},
+		{"min real port", "1", 1, 1},
+		{"max real port", "65535", 65535, 65535},
+		{"range zero to max forces end to zero", "0-65535", 0, 0},
+		{"range max to max", "65535-65535", 65535, 65535},
+		{"range one to max", "1-65535", 1, 65535},
+		{"range with whitespace inside", " 1 - 2    ", 1, 2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, e, err := parsePort(tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantStart, s, "start port")
+			assert.Equal(t, tc.wantEnd, e, "end port")
+		})
+	}
 }
 
 func TestNewFirewallFromConfig(t *testing.T) {
 	l := test.NewLogger()
 	// Test a bad rule definition
-	c := &cert.NebulaCertificate{}
-	conf := config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": "asdf"}
-	_, err := NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound failed to parse, should be an array of rules")
+	c := &dummyCert{}
+	cs, err := newCertState(cert.Version2, nil, c, false, cert.Curve_CURVE25519, nil, "aes")
+	require.NoError(t, err)
+
+	conf := config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": "asdf"}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound failed to parse, should be an array of rules")
 
 	// Test both port and code
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"port": "1", "code": "2"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; only one of port or code should be provided")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"port": "1", "code": "2"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; only one of port or code should be provided")
 
 	// Test missing host, group, cidr, ca_name and ca_sha
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; at least one of host, group, cidr, local_cidr, ca_name, or ca_sha must be provided")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; at least one of host, group, cidr, local_cidr, ca_name, or ca_sha must be provided")
 
 	// Test code/port error
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"code": "a", "host": "testh"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; code was not a number; `a`")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"code": "a", "host": "testh", "proto": "any"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; code was not a number; `a`")
 
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"port": "a", "host": "testh"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; port was not a number; `a`")
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"port": "a", "host": "testh", "proto": "any"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; port was not a number; `a`")
 
 	// Test proto error
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"code": "1", "host": "testh"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; proto was not understood; ``")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"code": "1", "host": "testh"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; proto was not understood; ``")
 
 	// Test cidr parse error
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"code": "1", "cidr": "testh", "proto": "any"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; cidr did not parse; invalid CIDR address: testh")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"code": "1", "cidr": "testh", "proto": "any"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; cidr did not parse; netip.ParsePrefix(\"testh\"): no '/'")
 
 	// Test local_cidr parse error
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"code": "1", "local_cidr": "testh", "proto": "any"}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.outbound rule #0; local_cidr did not parse; invalid CIDR address: testh")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"code": "1", "local_cidr": "testh", "proto": "any"}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.outbound rule #0; local_cidr did not parse; netip.ParsePrefix(\"testh\"): no '/'")
 
 	// Test both group and groups
-	conf = config.NewC(l)
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "group": "a", "groups": []string{"b", "c"}}}}
-	_, err = NewFirewallFromConfig(l, c, conf)
-	assert.EqualError(t, err, "firewall.inbound rule #0; only one of group or groups should be defined, both provided")
+	conf = config.NewC(test.NewLogger())
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "group": "a", "groups": []string{"b", "c"}}}}
+	_, err = NewFirewallFromConfig(l, cs, conf)
+	require.EqualError(t, err, "firewall.inbound rule #0; only one of group or groups should be defined, both provided")
 }
 
 func TestAddFirewallRulesFromConfig(t *testing.T) {
 	l := test.NewLogger()
 	// Test adding tcp rule
-	conf := config.NewC(l)
+	conf := config.NewC(test.NewLogger())
 	mf := &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "tcp", "host": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, false, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoTCP, startPort: 1, endPort: 1, groups: nil, host: "a", ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"port": "1", "proto": "tcp", "host": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, false, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoTCP, startPort: 1, endPort: 1, groups: nil, host: "a", ip: "", localIp: ""}, mf.lastCall)
 
 	// Test adding udp rule
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "udp", "host": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, false, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoUDP, startPort: 1, endPort: 1, groups: nil, host: "a", ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"port": "1", "proto": "udp", "host": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, false, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoUDP, startPort: 1, endPort: 1, groups: nil, host: "a", ip: "", localIp: ""}, mf.lastCall)
 
 	// Test adding icmp rule
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"outbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "icmp", "host": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, false, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoICMP, startPort: 1, endPort: 1, groups: nil, host: "a", ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"port": "1", "proto": "icmp", "host": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, false, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoICMP, startPort: firewall.PortAny, endPort: firewall.PortAny, groups: nil, host: "a", ip: "", localIp: ""}, mf.lastCall)
+
+	// Test adding icmp rule no port
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"outbound": []any{map[string]any{"proto": "icmp", "host": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, false, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: false, proto: firewall.ProtoICMP, startPort: firewall.PortAny, endPort: firewall.PortAny, groups: nil, host: "a", ip: "", localIp: ""}, mf.lastCall)
 
 	// Test adding any rule
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "host": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, host: "a", ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "host": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, host: "a", ip: "", localIp: ""}, mf.lastCall)
 
 	// Test adding rule with cidr
-	cidr := &net.IPNet{IP: net.ParseIP("10.0.0.0").To4(), Mask: net.IPv4Mask(255, 0, 0, 0)}
-	conf = config.NewC(l)
+	cidr := netip.MustParsePrefix("10.0.0.0/8")
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "cidr": cidr.String()}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: cidr, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "cidr": cidr.String()}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: cidr.String(), localIp: ""}, mf.lastCall)
 
 	// Test adding rule with local_cidr
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "local_cidr": cidr.String()}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: nil, localIp: cidr}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "local_cidr": cidr.String()}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: "", localIp: cidr.String()}, mf.lastCall)
+
+	// Test adding rule with cidr ipv6
+	cidr6 := netip.MustParsePrefix("fd00::/8")
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "cidr": cidr6.String()}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: cidr6.String(), localIp: ""}, mf.lastCall)
+
+	// Test adding rule with any cidr
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "cidr": "any"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: "any", localIp: ""}, mf.lastCall)
+
+	// Test adding rule with junk cidr
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "cidr": "junk/junk"}}}
+	require.EqualError(t, AddFirewallRulesFromConfig(l, true, conf, mf), "firewall.inbound rule #0; cidr did not parse; netip.ParsePrefix(\"junk/junk\"): ParseAddr(\"junk\"): unable to parse IP")
+
+	// Test adding rule with local_cidr ipv6
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "local_cidr": cidr6.String()}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: "", localIp: cidr6.String()}, mf.lastCall)
+
+	// Test adding rule with any local_cidr
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "local_cidr": "any"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, localIp: "any"}, mf.lastCall)
+
+	// Test adding rule with junk local_cidr
+	conf = config.NewC(test.NewLogger())
+	mf = &mockFirewall{}
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "local_cidr": "junk/junk"}}}
+	require.EqualError(t, AddFirewallRulesFromConfig(l, true, conf, mf), "firewall.inbound rule #0; local_cidr did not parse; netip.ParsePrefix(\"junk/junk\"): ParseAddr(\"junk\"): unable to parse IP")
 
 	// Test adding rule with ca_sha
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "ca_sha": "12312313123"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: nil, localIp: nil, caSha: "12312313123"}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "ca_sha": "12312313123"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: "", localIp: "", caSha: "12312313123"}, mf.lastCall)
 
 	// Test adding rule with ca_name
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "ca_name": "root01"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: nil, localIp: nil, caName: "root01"}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "ca_name": "root01"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: nil, ip: "", localIp: "", caName: "root01"}, mf.lastCall)
 
 	// Test single group
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "group": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a"}, ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "group": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a"}, ip: "", localIp: ""}, mf.lastCall)
 
 	// Test single groups
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "groups": "a"}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a"}, ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "groups": "a"}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a"}, ip: "", localIp: ""}, mf.lastCall)
 
 	// Test multiple AND groups
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "groups": []string{"a", "b"}}}}
-	assert.Nil(t, AddFirewallRulesFromConfig(l, true, conf, mf))
-	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a", "b"}, ip: nil, localIp: nil}, mf.lastCall)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "groups": []string{"a", "b"}}}}
+	require.NoError(t, AddFirewallRulesFromConfig(l, true, conf, mf))
+	assert.Equal(t, addRuleCall{incoming: true, proto: firewall.ProtoAny, startPort: 1, endPort: 1, groups: []string{"a", "b"}, ip: "", localIp: ""}, mf.lastCall)
 
 	// Test Add error
-	conf = config.NewC(l)
+	conf = config.NewC(test.NewLogger())
 	mf = &mockFirewall{}
 	mf.nextCallReturn = errors.New("test error")
-	conf.Settings["firewall"] = map[interface{}]interface{}{"inbound": []interface{}{map[interface{}]interface{}{"port": "1", "proto": "any", "host": "a"}}}
-	assert.EqualError(t, AddFirewallRulesFromConfig(l, true, conf, mf), "firewall.inbound rule #0; `test error`")
-}
-
-func TestTCPRTTTracking(t *testing.T) {
-	b := make([]byte, 200)
-
-	// Max ip IHL (60 bytes) and tcp IHL (60 bytes)
-	b[0] = 15
-	b[60+12] = 15 << 4
-	f := Firewall{
-		metricTCPRTT: metrics.GetOrRegisterHistogram("nope", nil, metrics.NewExpDecaySample(1028, 0.015)),
-	}
-
-	// Set SEQ to 1
-	binary.BigEndian.PutUint32(b[60+4:60+8], 1)
-
-	c := &conn{}
-	setTCPRTTTracking(c, b)
-	assert.Equal(t, uint32(1), c.Seq)
-
-	// Bad ack - no ack flag
-	binary.BigEndian.PutUint32(b[60+8:60+12], 80)
-	assert.False(t, f.checkTCPRTT(c, b))
-
-	// Bad ack, number is too low
-	binary.BigEndian.PutUint32(b[60+8:60+12], 0)
-	b[60+13] = uint8(0x10)
-	assert.False(t, f.checkTCPRTT(c, b))
-
-	// Good ack
-	binary.BigEndian.PutUint32(b[60+8:60+12], 80)
-	assert.True(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, uint32(0), c.Seq)
-
-	// Set SEQ to 1
-	binary.BigEndian.PutUint32(b[60+4:60+8], 1)
-	c = &conn{}
-	setTCPRTTTracking(c, b)
-	assert.Equal(t, uint32(1), c.Seq)
-
-	// Good acks
-	binary.BigEndian.PutUint32(b[60+8:60+12], 81)
-	assert.True(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, uint32(0), c.Seq)
-
-	// Set SEQ to max uint32 - 20
-	binary.BigEndian.PutUint32(b[60+4:60+8], ^uint32(0)-20)
-	c = &conn{}
-	setTCPRTTTracking(c, b)
-	assert.Equal(t, ^uint32(0)-20, c.Seq)
-
-	// Good acks
-	binary.BigEndian.PutUint32(b[60+8:60+12], 81)
-	assert.True(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, uint32(0), c.Seq)
-
-	// Set SEQ to max uint32 / 2
-	binary.BigEndian.PutUint32(b[60+4:60+8], ^uint32(0)/2)
-	c = &conn{}
-	setTCPRTTTracking(c, b)
-	assert.Equal(t, ^uint32(0)/2, c.Seq)
-
-	// Below
-	binary.BigEndian.PutUint32(b[60+8:60+12], ^uint32(0)/2-1)
-	assert.False(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, ^uint32(0)/2, c.Seq)
-
-	// Halfway below
-	binary.BigEndian.PutUint32(b[60+8:60+12], uint32(0))
-	assert.False(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, ^uint32(0)/2, c.Seq)
-
-	// Halfway above is ok
-	binary.BigEndian.PutUint32(b[60+8:60+12], ^uint32(0))
-	assert.True(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, uint32(0), c.Seq)
-
-	// Set SEQ to max uint32
-	binary.BigEndian.PutUint32(b[60+4:60+8], ^uint32(0))
-	c = &conn{}
-	setTCPRTTTracking(c, b)
-	assert.Equal(t, ^uint32(0), c.Seq)
-
-	// Halfway + 1 above
-	binary.BigEndian.PutUint32(b[60+8:60+12], ^uint32(0)/2+1)
-	assert.False(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, ^uint32(0), c.Seq)
-
-	// Halfway above
-	binary.BigEndian.PutUint32(b[60+8:60+12], ^uint32(0)/2)
-	assert.True(t, f.checkTCPRTT(c, b))
-	assert.Equal(t, uint32(0), c.Seq)
+	conf.Settings["firewall"] = map[string]any{"inbound": []any{map[string]any{"port": "1", "proto": "any", "host": "a"}}}
+	require.EqualError(t, AddFirewallRulesFromConfig(l, true, conf, mf), "firewall.inbound rule #0; `test error`")
 }
 
 func TestFirewall_convertRule(t *testing.T) {
-	l := test.NewLogger()
 	ob := &bytes.Buffer{}
-	l.SetOutput(ob)
+	l := test.NewLoggerWithOutput(ob)
 
 	// Ensure group array of 1 is converted and a warning is printed
-	c := map[interface{}]interface{}{
-		"group": []interface{}{"group1"},
+	c := map[string]any{
+		"group": []any{"group1"},
 	}
 
 	r, err := convertRule(l, c, "test", 1)
-	assert.Contains(t, ob.String(), "test rule #1; group was an array with a single value, converting to simple value")
-	assert.Nil(t, err)
-	assert.Equal(t, "group1", r.Group)
+	assert.Contains(t, ob.String(), "group was an array with a single value, converting to simple value")
+	assert.Contains(t, ob.String(), "table=test")
+	assert.Contains(t, ob.String(), "rule=1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"group1"}, r.Groups)
 
 	// Ensure group array of > 1 is errord
 	ob.Reset()
-	c = map[interface{}]interface{}{
-		"group": []interface{}{"group1", "group2"},
+	c = map[string]any{
+		"group": []any{"group1", "group2"},
 	}
 
 	r, err = convertRule(l, c, "test", 1)
-	assert.Equal(t, "", ob.String())
-	assert.Error(t, err, "group should contain a single value, an array with more than one entry was provided")
+	assert.Empty(t, ob.String())
+	require.Error(t, err, "group should contain a single value, an array with more than one entry was provided")
 
 	// Make sure a well formed group is alright
 	ob.Reset()
-	c = map[interface{}]interface{}{
+	c = map[string]any{
 		"group": "group1",
 	}
 
 	r, err = convertRule(l, c, "test", 1)
-	assert.Nil(t, err)
-	assert.Equal(t, "group1", r.Group)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"group1"}, r.Groups)
+}
+
+func TestFirewall_convertRuleSanity(t *testing.T) {
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+
+	noWarningPlease := []map[string]any{
+		{"group": "group1"},
+		{"groups": []any{"group2"}},
+		{"host": "bob"},
+		{"cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "host": "bob"},
+		{"cidr": "1.1.1.1/1", "host": "bob"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1", "host": "bob"},
+	}
+	for _, c := range noWarningPlease {
+		r, err := convertRule(l, c, "test", 1)
+		require.NoError(t, err)
+		require.NoError(t, r.sanity(), "should not generate a sanity warning, %+v", c)
+	}
+
+	yesWarningPlease := []map[string]any{
+		{"group": "group1"},
+		{"groups": []any{"group2"}},
+		{"cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "host": "bob"},
+		{"cidr": "1.1.1.1/1", "host": "bob"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1", "host": "bob"},
+	}
+	for _, c := range yesWarningPlease {
+		c["host"] = "any"
+		r, err := convertRule(l, c, "test", 1)
+		require.NoError(t, err)
+		err = r.sanity()
+		require.Error(t, err, "I wanted a warning: %+v", c)
+	}
+	//reset the list
+	yesWarningPlease = []map[string]any{
+		{"group": "group1"},
+		{"groups": []any{"group2"}},
+		{"cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "host": "bob"},
+		{"cidr": "1.1.1.1/1", "host": "bob"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1"},
+		{"groups": []any{"group2"}, "cidr": "1.1.1.1/1", "host": "bob"},
+	}
+	for _, c := range yesWarningPlease {
+		r, err := convertRule(l, c, "test", 1)
+		require.NoError(t, err)
+		r.Groups = append(r.Groups, "any")
+		err = r.sanity()
+		require.Error(t, err, "I wanted a warning: %+v", c)
+	}
+}
+
+type testcase struct {
+	h   *HostInfo
+	p   firewall.Packet
+	c   cert.Certificate
+	err error
+}
+
+func (c *testcase) Test(t *testing.T, fw *Firewall) {
+	t.Helper()
+	cp := cert.NewCAPool()
+	resetConntrack(fw)
+	err := fw.Drop(c.p, true, c.h, cp, nil)
+	if c.err == nil {
+		require.NoError(t, err, "failed to not drop remote address %s", c.p.RemoteAddr)
+	} else {
+		require.ErrorIs(t, c.err, err, "failed to drop remote address %s", c.p.RemoteAddr)
+	}
+}
+
+func buildTestCase(setup testsetup, err error, theirPrefixes ...netip.Prefix) testcase {
+	c1 := dummyCert{
+		name:     "host1",
+		networks: theirPrefixes,
+		groups:   []string{"default-group"},
+		issuer:   "signer-shasum",
+	}
+	h := HostInfo{
+		ConnectionState: &ConnectionState{
+			peerCert: &cert.CachedCertificate{
+				Certificate:    &c1,
+				InvertedGroups: map[string]struct{}{"default-group": {}},
+			},
+		},
+		vpnAddrs: make([]netip.Addr, len(theirPrefixes)),
+	}
+	for i := range theirPrefixes {
+		h.vpnAddrs[i] = theirPrefixes[i].Addr()
+	}
+	h.buildNetworks(setup.myVpnNetworksTable, &c1)
+	p := firewall.Packet{
+		LocalAddr:  setup.c.Networks()[0].Addr(), //todo?
+		RemoteAddr: theirPrefixes[0].Addr(),
+		LocalPort:  10,
+		RemotePort: 90,
+		Protocol:   firewall.ProtoUDP,
+		Fragment:   false,
+	}
+	return testcase{
+		h:   &h,
+		p:   p,
+		c:   &c1,
+		err: err,
+	}
+}
+
+type testsetup struct {
+	c                  dummyCert
+	myVpnNetworksTable *bart.Lite
+	fw                 *Firewall
+}
+
+func newSetup(t *testing.T, l *slog.Logger, myPrefixes ...netip.Prefix) testsetup {
+	c := dummyCert{
+		name:     "me",
+		networks: myPrefixes,
+		groups:   []string{"default-group"},
+		issuer:   "signer-shasum",
+	}
+
+	return newSetupFromCert(t, l, c)
+}
+
+func newSetupFromCert(t *testing.T, l *slog.Logger, c dummyCert) testsetup {
+	myVpnNetworksTable := new(bart.Lite)
+	for _, prefix := range c.Networks() {
+		myVpnNetworksTable.Insert(prefix)
+	}
+	fw := NewFirewall(l, time.Second, time.Minute, time.Hour, &c)
+	require.NoError(t, fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", "", "", ""))
+
+	return testsetup{
+		c:                  c,
+		fw:                 fw,
+		myVpnNetworksTable: myVpnNetworksTable,
+	}
+}
+
+func TestFirewall_Drop_EnforceIPMatch(t *testing.T) {
+	t.Parallel()
+	ob := &bytes.Buffer{}
+	l := test.NewLoggerWithOutput(ob)
+
+	myPrefix := netip.MustParsePrefix("1.1.1.1/8")
+	// for now, it's okay that these are all "incoming", the logic this test tries to check doesn't care about in/out
+	t.Run("allow inbound all matching", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, nil, netip.MustParsePrefix("1.2.3.4/24"))
+		tc.Test(t, setup.fw)
+	})
+	t.Run("allow inbound local matching", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, ErrInvalidLocalIP, netip.MustParsePrefix("1.2.3.4/24"))
+		tc.p.LocalAddr = netip.MustParseAddr("1.2.3.8")
+		tc.Test(t, setup.fw)
+	})
+	t.Run("block inbound remote mismatched", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, ErrInvalidRemoteIP, netip.MustParsePrefix("1.2.3.4/24"))
+		tc.p.RemoteAddr = netip.MustParseAddr("9.9.9.9")
+		tc.Test(t, setup.fw)
+	})
+	t.Run("Block a vpn peer packet", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, ErrPeerRejected, netip.MustParsePrefix("2.2.2.2/24"))
+		tc.Test(t, setup.fw)
+	})
+	twoPrefixes := []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.4/24"), netip.MustParsePrefix("2.2.2.2/24"),
+	}
+	t.Run("allow inbound one matching", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, nil, twoPrefixes...)
+		tc.Test(t, setup.fw)
+	})
+	t.Run("block inbound multimismatch", func(t *testing.T) {
+		t.Parallel()
+		setup := newSetup(t, l, myPrefix)
+		tc := buildTestCase(setup, ErrInvalidRemoteIP, twoPrefixes...)
+		tc.p.RemoteAddr = netip.MustParseAddr("9.9.9.9")
+		tc.Test(t, setup.fw)
+	})
+	t.Run("allow inbound 2nd one matching", func(t *testing.T) {
+		t.Parallel()
+		setup2 := newSetup(t, l, netip.MustParsePrefix("2.2.2.1/24"))
+		tc := buildTestCase(setup2, nil, twoPrefixes...)
+		tc.p.RemoteAddr = twoPrefixes[1].Addr()
+		tc.Test(t, setup2.fw)
+	})
+	t.Run("allow inbound unsafe route", func(t *testing.T) {
+		t.Parallel()
+		unsafePrefix := netip.MustParsePrefix("192.168.0.0/24")
+		c := dummyCert{
+			name:           "me",
+			networks:       []netip.Prefix{myPrefix},
+			unsafeNetworks: []netip.Prefix{unsafePrefix},
+			groups:         []string{"default-group"},
+			issuer:         "signer-shasum",
+		}
+		unsafeSetup := newSetupFromCert(t, l, c)
+		tc := buildTestCase(unsafeSetup, nil, twoPrefixes...)
+		tc.p.LocalAddr = netip.MustParseAddr("192.168.0.3")
+		tc.err = ErrNoMatchingRule
+		tc.Test(t, unsafeSetup.fw) //should hit firewall and bounce off
+		require.NoError(t, unsafeSetup.fw.AddRule(true, firewall.ProtoAny, 0, 0, []string{"any"}, "", "", unsafePrefix.String(), "", ""))
+		tc.err = nil
+		tc.Test(t, unsafeSetup.fw) //should pass
+	})
 }
 
 type addRuleCall struct {
@@ -964,8 +1709,8 @@ type addRuleCall struct {
 	endPort   int32
 	groups    []string
 	host      string
-	ip        *net.IPNet
-	localIp   *net.IPNet
+	ip        string
+	localIp   string
 	caName    string
 	caSha     string
 }
@@ -975,7 +1720,7 @@ type mockFirewall struct {
 	nextCallReturn error
 }
 
-func (mf *mockFirewall) AddRule(incoming bool, proto uint8, startPort int32, endPort int32, groups []string, host string, ip *net.IPNet, localIp *net.IPNet, caName string, caSha string) error {
+func (mf *mockFirewall) AddRule(incoming bool, proto uint8, startPort int32, endPort int32, groups []string, host string, ip, localIp, caName string, caSha string) error {
 	mf.lastCall = addRuleCall{
 		incoming:  incoming,
 		proto:     proto,

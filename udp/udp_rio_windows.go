@@ -9,17 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/firewall"
-	"github.com/slackhq/nebula/header"
-
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/conn/winrio"
 )
@@ -54,23 +53,21 @@ type ringBuffer struct {
 
 type RIOConn struct {
 	isOpen  atomic.Bool
-	l       *logrus.Logger
+	l       *slog.Logger
 	sock    windows.Handle
 	rx, tx  ringBuffer
 	rq      winrio.Rq
 	results [packetsPerRing]winrio.Result
 }
 
-func NewRIOListener(l *logrus.Logger, ip net.IP, port int) (*RIOConn, error) {
+func NewRIOListener(l *slog.Logger, addr netip.Addr, port int) (*RIOConn, error) {
 	if !winrio.Initialize() {
 		return nil, errors.New("could not initialize winrio")
 	}
 
 	u := &RIOConn{l: l}
 
-	addr := [16]byte{}
-	copy(addr[:], ip.To16())
-	err := u.bind(&windows.SockaddrInet6{Addr: addr, Port: port})
+	err := u.bind(l, &windows.SockaddrInet6{Addr: addr.As16(), Port: port})
 	if err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
@@ -86,60 +83,85 @@ func NewRIOListener(l *logrus.Logger, ip net.IP, port int) (*RIOConn, error) {
 	return u, nil
 }
 
-func (u *RIOConn) bind(sa windows.Sockaddr) error {
+func (u *RIOConn) bind(l *slog.Logger, sa windows.Sockaddr) error {
 	var err error
 	u.sock, err = winrio.Socket(windows.AF_INET6, windows.SOCK_DGRAM, windows.IPPROTO_UDP)
 	if err != nil {
-		return err
+		return fmt.Errorf("winrio.Socket error: %w", err)
 	}
 
 	// Enable v4 for this socket
 	syscall.SetsockoptInt(syscall.Handle(u.sock), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 0)
 
+	// Disable reporting of PORT_UNREACHABLE and NET_UNREACHABLE errors from the UDP socket receive call.
+	// These errors are returned on Windows during UDP receives based on the receipt of ICMP packets. Disable
+	// the UDP receive error returns with these ioctl calls.
+	ret := uint32(0)
+	flag := uint32(0)
+	size := uint32(unsafe.Sizeof(flag))
+	err = syscall.WSAIoctl(syscall.Handle(u.sock), syscall.SIO_UDP_CONNRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+	if err != nil {
+		// This is a best-effort to prevent errors from being returned by the udp recv operation.
+		// Quietly log a failure and continue.
+		l.Debug("failed to set UDP_CONNRESET ioctl", "error", err)
+	}
+
+	ret = 0
+	flag = 0
+	size = uint32(unsafe.Sizeof(flag))
+	SIO_UDP_NETRESET := uint32(syscall.IOC_IN | syscall.IOC_VENDOR | 15)
+	err = syscall.WSAIoctl(syscall.Handle(u.sock), SIO_UDP_NETRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+	if err != nil {
+		// This is a best-effort to prevent errors from being returned by the udp recv operation.
+		// Quietly log a failure and continue.
+		l.Debug("failed to set UDP_NETRESET ioctl", "error", err)
+	}
+
 	err = u.rx.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("error rx.Open(): %w", err)
 	}
 
 	err = u.tx.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("error tx.Open(): %w", err)
 	}
 
 	u.rq, err = winrio.CreateRequestQueue(u.sock, packetsPerRing, 1, packetsPerRing, 1, u.rx.cq, u.tx.cq, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("error CreateRequestQueue: %w", err)
 	}
 
 	err = windows.Bind(u.sock, sa)
 	if err != nil {
-		return err
+		return fmt.Errorf("error windows.Bind(): %w", err)
 	}
 
 	return nil
 }
 
-func (u *RIOConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
-	plaintext := make([]byte, MTU)
+func (u *RIOConn) ListenOut(r EncReader) error {
 	buffer := make([]byte, MTU)
-	h := &header.H{}
-	fwPacket := &firewall.Packet{}
-	udpAddr := &Addr{IP: make([]byte, 16)}
-	nb := make([]byte, 12, 12)
+
+	var lastRecvErr time.Time
 
 	for {
 		// Just read one packet at a time
 		n, rua, err := u.receive(buffer)
+
 		if err != nil {
-			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			// Dampen unexpected message warns to once per minute
+			if lastRecvErr.IsZero() || time.Since(lastRecvErr) > time.Minute {
+				lastRecvErr = time.Now()
+				u.l.Warn("unexpected udp socket receive error", "error", err)
+			}
+			continue
 		}
 
-		udpAddr.IP = rua.Addr[:]
-		p := (*[2]byte)(unsafe.Pointer(&udpAddr.Port))
-		p[0] = byte(rua.Port >> 8)
-		p[1] = byte(rua.Port)
-		r(udpAddr, plaintext[:0], buffer[:n], h, fwPacket, lhf, nb, q, cache.Get(u.l))
+		r(netip.AddrPortFrom(netip.AddrFrom16(rua.Addr).Unmap(), (rua.Port>>8)|((rua.Port&0xff)<<8)), buffer[:n])
 	}
 }
 
@@ -231,7 +253,7 @@ retry:
 	return n, ep, nil
 }
 
-func (u *RIOConn) WriteTo(buf []byte, addr *Addr) error {
+func (u *RIOConn) WriteTo(buf []byte, ip netip.AddrPort) error {
 	if !u.isOpen.Load() {
 		return net.ErrClosed
 	}
@@ -274,10 +296,9 @@ func (u *RIOConn) WriteTo(buf []byte, addr *Addr) error {
 
 	packet := u.tx.Push()
 	packet.addr.Family = windows.AF_INET6
-	p := (*[2]byte)(unsafe.Pointer(&packet.addr.Port))
-	p[0] = byte(addr.Port >> 8)
-	p[1] = byte(addr.Port)
-	copy(packet.addr.Addr[:], addr.IP.To16())
+	packet.addr.Addr = ip.Addr().As16()
+	port := ip.Port()
+	packet.addr.Port = (port >> 8) | ((port & 0xff) << 8)
 	copy(packet.data[:], buf)
 
 	dataBuffer := &winrio.Buffer{
@@ -295,17 +316,19 @@ func (u *RIOConn) WriteTo(buf []byte, addr *Addr) error {
 	return winrio.SendEx(u.rq, dataBuffer, 1, nil, addressBuffer, nil, nil, 0, 0)
 }
 
-func (u *RIOConn) LocalAddr() (*Addr, error) {
+func (u *RIOConn) LocalAddr() (netip.AddrPort, error) {
 	sa, err := windows.Getsockname(u.sock)
 	if err != nil {
-		return nil, err
+		return netip.AddrPort{}, err
 	}
 
 	v6 := sa.(*windows.SockaddrInet6)
-	return &Addr{
-		IP:   v6.Addr[:],
-		Port: uint16(v6.Port),
-	}, nil
+	return netip.AddrPortFrom(netip.AddrFrom16(v6.Addr).Unmap(), uint16(v6.Port)), nil
+
+}
+
+func (u *RIOConn) SupportsMultipleReaders() bool {
+	return false
 }
 
 func (u *RIOConn) Rebind() error {

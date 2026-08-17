@@ -1,6 +1,6 @@
-//go:build linux && (amd64 || arm64 || ppc64 || ppc64le || mips64 || mips64le || s390x || riscv64) && !android && !e2e_testing
+//go:build linux && (amd64 || arm64 || ppc64 || ppc64le || mips64 || mips64le || s390x || riscv64 || loong64) && !android && !e2e_testing
 // +build linux
-// +build amd64 arm64 ppc64 ppc64le mips64 mips64le s390x riscv64
+// +build amd64 arm64 ppc64 ppc64le mips64 mips64le s390x riscv64 loong64
 // +build !android
 // +build !e2e_testing
 
@@ -42,7 +42,6 @@ func (u *StdConn) PrepareRawMessages(n int) ([]rawMessage, [][]byte, [][]byte) {
 		buffers[i] = make([]byte, MTU)
 		names[i] = make([]byte, unix.SizeofSockaddrInet6)
 
-		//TODO: this is still silly, no need for an array
 		vs := []iovec{
 			{Base: &buffers[i][0], Len: uint64(len(buffers[i]))},
 		}

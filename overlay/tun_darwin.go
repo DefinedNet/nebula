@@ -7,65 +7,45 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
 	"os"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 
-	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula/cidr"
+	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
 	netroute "golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 )
 
 type tun struct {
-	io.ReadWriteCloser
-	Device     string
-	cidr       *net.IPNet
-	DefaultMTU int
-	Routes     atomic.Pointer[[]Route]
-	routeTree  atomic.Pointer[cidr.Tree4[iputil.VpnIp]]
-	linkAddr   *netroute.LinkAddr
-	l          *logrus.Logger
-
-	// cache out buffer since we need to prepend 4 bytes for tun metadata
-	out []byte
-}
-
-type sockaddrCtl struct {
-	scLen      uint8
-	scFamily   uint8
-	ssSysaddr  uint16
-	scID       uint32
-	scUnit     uint32
-	scReserved [5]uint32
+	f           *os.File
+	Device      string
+	vpnNetworks []netip.Prefix
+	DefaultMTU  int
+	Routes      atomic.Pointer[[]Route]
+	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
+	linkAddr    *netroute.LinkAddr
+	l           *slog.Logger
 }
 
 type ifReq struct {
-	Name  [16]byte
+	Name  [unix.IFNAMSIZ]byte
 	Flags uint16
 	pad   [8]byte
 }
 
-var sockaddrCtlSize uintptr = 32
-
 const (
-	_SYSPROTO_CONTROL = 2              //define SYSPROTO_CONTROL 2 /* kernel control protocol */
-	_AF_SYS_CONTROL   = 2              //#define AF_SYS_CONTROL 2 /* corresponding sub address type */
-	_PF_SYSTEM        = unix.AF_SYSTEM //#define PF_SYSTEM AF_SYSTEM
-	_CTLIOCGINFO      = 3227799043     //#define CTLIOCGINFO     _IOWR('N', 3, struct ctl_info)
-	utunControlName   = "com.apple.net.utun_control"
+	_SIOCAIFADDR_IN6 = 2155899162
+	_UTUN_OPT_IFNAME = 2
+	_IN6_IFF_NODAD   = 0x0020
+	_IN6_IFF_SECURED = 0x0400
+	utunControlName  = "com.apple.net.utun_control"
 )
-
-type ifreqAddr struct {
-	Name [16]byte
-	Addr unix.RawSockaddrInet4
-	pad  [8]byte
-}
 
 type ifreqMTU struct {
 	Name [16]byte
@@ -73,7 +53,30 @@ type ifreqMTU struct {
 	pad  [8]byte
 }
 
-func newTun(c *config.C, l *logrus.Logger, cidr *net.IPNet, _ bool) (*tun, error) {
+type addrLifetime struct {
+	Expire    float64
+	Preferred float64
+	Vltime    uint32
+	Pltime    uint32
+}
+
+type ifreqAlias4 struct {
+	Name     [unix.IFNAMSIZ]byte
+	Addr     unix.RawSockaddrInet4
+	DstAddr  unix.RawSockaddrInet4
+	MaskAddr unix.RawSockaddrInet4
+}
+
+type ifreqAlias6 struct {
+	Name       [unix.IFNAMSIZ]byte
+	Addr       unix.RawSockaddrInet6
+	DstAddr    unix.RawSockaddrInet6
+	PrefixMask unix.RawSockaddrInet6
+	Flags      uint32
+	Lifetime   addrLifetime
+}
+
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
 	name := c.GetString("tun.dev", "")
 	ifIndex := -1
 	if name != "" && name != "utun" {
@@ -86,68 +89,43 @@ func newTun(c *config.C, l *logrus.Logger, cidr *net.IPNet, _ bool) (*tun, error
 		}
 	}
 
-	fd, err := unix.Socket(_PF_SYSTEM, unix.SOCK_DGRAM, _SYSPROTO_CONTROL)
+	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, unix.AF_SYS_CONTROL)
 	if err != nil {
 		return nil, fmt.Errorf("system socket: %v", err)
 	}
 
-	var ctlInfo = &struct {
-		ctlID   uint32
-		ctlName [96]byte
-	}{}
+	var ctlInfo = &unix.CtlInfo{}
+	copy(ctlInfo.Name[:], utunControlName)
 
-	copy(ctlInfo.ctlName[:], utunControlName)
-
-	err = ioctl(uintptr(fd), uintptr(_CTLIOCGINFO), uintptr(unsafe.Pointer(ctlInfo)))
+	err = unix.IoctlCtlInfo(fd, ctlInfo)
 	if err != nil {
 		return nil, fmt.Errorf("CTLIOCGINFO: %v", err)
 	}
 
-	sc := sockaddrCtl{
-		scLen:     uint8(sockaddrCtlSize),
-		scFamily:  unix.AF_SYSTEM,
-		ssSysaddr: _AF_SYS_CONTROL,
-		scID:      ctlInfo.ctlID,
-		scUnit:    uint32(ifIndex) + 1,
+	err = unix.Connect(fd, &unix.SockaddrCtl{
+		ID:   ctlInfo.Id,
+		Unit: uint32(ifIndex) + 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("SYS_CONNECT: %v", err)
 	}
 
-	_, _, errno := unix.RawSyscall(
-		unix.SYS_CONNECT,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&sc)),
-		sockaddrCtlSize,
-	)
-	if errno != 0 {
-		return nil, fmt.Errorf("SYS_CONNECT: %v", errno)
+	name, err = unix.GetsockoptString(fd, unix.AF_SYS_CONTROL, _UTUN_OPT_IFNAME)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve tun name: %w", err)
 	}
 
-	var ifName struct {
-		name [16]byte
-	}
-	ifNameSize := uintptr(len(ifName.name))
-	_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd),
-		2, // SYSPROTO_CONTROL
-		2, // UTUN_OPT_IFNAME
-		uintptr(unsafe.Pointer(&ifName)),
-		uintptr(unsafe.Pointer(&ifNameSize)), 0)
-	if errno != 0 {
-		return nil, fmt.Errorf("SYS_GETSOCKOPT: %v", errno)
-	}
-	name = string(ifName.name[:ifNameSize-1])
-
-	err = syscall.SetNonblock(fd, true)
+	err = unix.SetNonblock(fd, true)
 	if err != nil {
 		return nil, fmt.Errorf("SetNonblock: %v", err)
 	}
 
-	file := os.NewFile(uintptr(fd), "")
-
 	t := &tun{
-		ReadWriteCloser: file,
-		Device:          name,
-		cidr:            cidr,
-		DefaultMTU:      c.GetInt("tun.mtu", DefaultMTU),
-		l:               l,
+		f:           os.NewFile(uintptr(fd), ""),
+		Device:      name,
+		vpnNetworks: vpnNetworks,
+		DefaultMTU:  c.GetInt("tun.mtu", DefaultMTU),
+		l:           l,
 	}
 
 	err = t.reload(c, true)
@@ -172,24 +150,19 @@ func (t *tun) deviceBytes() (o [16]byte) {
 	return
 }
 
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ *net.IPNet) (*tun, error) {
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (*tun, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in Darwin")
 }
 
 func (t *tun) Close() error {
-	if t.ReadWriteCloser != nil {
-		return t.ReadWriteCloser.Close()
+	if t.f != nil {
+		return t.f.Close()
 	}
 	return nil
 }
 
 func (t *tun) Activate() error {
 	devName := t.deviceBytes()
-
-	var addr, mask [4]byte
-
-	copy(addr[:], t.cidr.IP.To4())
-	copy(mask[:], t.cidr.Mask)
 
 	s, err := unix.Socket(
 		unix.AF_INET,
@@ -203,66 +176,18 @@ func (t *tun) Activate() error {
 
 	fd := uintptr(s)
 
-	ifra := ifreqAddr{
-		Name: devName,
-		Addr: unix.RawSockaddrInet4{
-			Family: unix.AF_INET,
-			Addr:   addr,
-		},
-	}
-
-	// Set the device ip address
-	if err = ioctl(fd, unix.SIOCSIFADDR, uintptr(unsafe.Pointer(&ifra))); err != nil {
-		return fmt.Errorf("failed to set tun address: %s", err)
-	}
-
-	// Set the device network
-	ifra.Addr.Addr = mask
-	if err = ioctl(fd, unix.SIOCSIFNETMASK, uintptr(unsafe.Pointer(&ifra))); err != nil {
-		return fmt.Errorf("failed to set tun netmask: %s", err)
-	}
-
-	// Set the device name
-	ifrf := ifReq{Name: devName}
-	if err = ioctl(fd, unix.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifrf))); err != nil {
-		return fmt.Errorf("failed to set tun device name: %s", err)
-	}
-
 	// Set the MTU on the device
 	ifm := ifreqMTU{Name: devName, MTU: int32(t.DefaultMTU)}
 	if err = ioctl(fd, unix.SIOCSIFMTU, uintptr(unsafe.Pointer(&ifm))); err != nil {
 		return fmt.Errorf("failed to set tun mtu: %v", err)
 	}
 
-	/*
-		// Set the transmit queue length
-		ifrq := ifreqQLEN{Name: devName, Value: int32(t.TXQueueLen)}
-		if err = ioctl(fd, unix.SIOCSIFTXQLEN, uintptr(unsafe.Pointer(&ifrq))); err != nil {
-			// If we can't set the queue length nebula will still work but it may lead to packet loss
-			l.WithError(err).Error("Failed to set tun tx queue length")
-		}
-	*/
-
-	// Bring up the interface
-	ifrf.Flags = ifrf.Flags | unix.IFF_UP
-	if err = ioctl(fd, unix.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&ifrf))); err != nil {
-		return fmt.Errorf("failed to bring the tun device up: %s", err)
+	// Get the device flags
+	ifrf := ifReq{Name: devName}
+	if err = ioctl(fd, unix.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifrf))); err != nil {
+		return fmt.Errorf("failed to get tun flags: %s", err)
 	}
 
-	routeSock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
-	if err != nil {
-		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
-	}
-	defer func() {
-		unix.Shutdown(routeSock, unix.SHUT_RDWR)
-		err := unix.Close(routeSock)
-		if err != nil {
-			t.l.WithError(err).Error("failed to close AF_ROUTE socket")
-		}
-	}()
-
-	routeAddr := &netroute.Inet4Addr{}
-	maskAddr := &netroute.Inet4Addr{}
 	linkAddr, err := getLinkAddr(t.Device)
 	if err != nil {
 		return err
@@ -272,14 +197,18 @@ func (t *tun) Activate() error {
 	}
 	t.linkAddr = linkAddr
 
-	copy(routeAddr.IP[:], addr[:])
-	copy(maskAddr.IP[:], mask[:])
-	err = addRoute(routeSock, routeAddr, maskAddr, linkAddr)
-	if err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			err = fmt.Errorf("unable to add tun route, identical route already exists: %s", t.cidr)
+	for _, network := range t.vpnNetworks {
+		if network.Addr().Is4() {
+			err = t.activate4(network)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = t.activate6(network)
+			if err != nil {
+				return err
+			}
 		}
-		return err
 	}
 
 	// Run the interface
@@ -292,8 +221,88 @@ func (t *tun) Activate() error {
 	return t.addRoutes(false)
 }
 
+func (t *tun) activate4(network netip.Prefix) error {
+	s, err := unix.Socket(
+		unix.AF_INET,
+		unix.SOCK_DGRAM,
+		unix.IPPROTO_IP,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(s)
+
+	ifr := ifreqAlias4{
+		Name: t.deviceBytes(),
+		Addr: unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   network.Addr().As4(),
+		},
+		DstAddr: unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   network.Addr().As4(),
+		},
+		MaskAddr: unix.RawSockaddrInet4{
+			Len:    unix.SizeofSockaddrInet4,
+			Family: unix.AF_INET,
+			Addr:   prefixToMask(network).As4(),
+		},
+	}
+
+	if err := ioctl(uintptr(s), unix.SIOCAIFADDR, uintptr(unsafe.Pointer(&ifr))); err != nil {
+		return fmt.Errorf("failed to set tun v4 address: %s", err)
+	}
+
+	err = addRoute(network, t.linkAddr)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *tun) activate6(network netip.Prefix) error {
+	s, err := unix.Socket(
+		unix.AF_INET6,
+		unix.SOCK_DGRAM,
+		unix.IPPROTO_IP,
+	)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(s)
+
+	ifr := ifreqAlias6{
+		Name: t.deviceBytes(),
+		Addr: unix.RawSockaddrInet6{
+			Len:    unix.SizeofSockaddrInet6,
+			Family: unix.AF_INET6,
+			Addr:   network.Addr().As16(),
+		},
+		PrefixMask: unix.RawSockaddrInet6{
+			Len:    unix.SizeofSockaddrInet6,
+			Family: unix.AF_INET6,
+			Addr:   prefixToMask(network).As16(),
+		},
+		Lifetime: addrLifetime{
+			// never expires
+			Vltime: 0xffffffff,
+			Pltime: 0xffffffff,
+		},
+		Flags: _IN6_IFF_NODAD,
+	}
+
+	if err := ioctl(uintptr(s), _SIOCAIFADDR_IN6, uintptr(unsafe.Pointer(&ifr))); err != nil {
+		return fmt.Errorf("failed to set tun address: %s", err)
+	}
+
+	return nil
+}
+
 func (t *tun) reload(c *config.C, initial bool) error {
-	change, routes, err := getAllRoutesFromConfig(c, t.cidr, initial)
+	change, routes, err := getAllRoutesFromConfig(c, t.vpnNetworks, initial)
 	if err != nil {
 		return err
 	}
@@ -329,17 +338,16 @@ func (t *tun) reload(c *config.C, initial bool) error {
 	return nil
 }
 
-func (t *tun) RouteFor(ip iputil.VpnIp) iputil.VpnIp {
-	ok, r := t.routeTree.Load().MostSpecificContains(ip)
+func (t *tun) RoutesFor(ip netip.Addr) routing.Gateways {
+	r, ok := t.routeTree.Load().Lookup(ip)
 	if ok {
 		return r
 	}
-
-	return 0
+	return routing.Gateways{}
 }
 
 // Get the LinkAddr for the interface of the given name
-// TODO: Is there an easier way to fetch this when we create the interface?
+// Is there an easier way to fetch this when we create the interface?
 // Maybe SIOCGIFINDEX? but this doesn't appear to exist in the darwin headers.
 func getLinkAddr(name string) (*netroute.LinkAddr, error) {
 	rib, err := netroute.FetchRIB(unix.AF_UNSPEC, unix.NET_RT_IFLIST, 0)
@@ -367,38 +375,20 @@ func getLinkAddr(name string) (*netroute.LinkAddr, error) {
 }
 
 func (t *tun) addRoutes(logErrors bool) error {
-	routeSock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
-	if err != nil {
-		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
-	}
-
-	defer func() {
-		unix.Shutdown(routeSock, unix.SHUT_RDWR)
-		err := unix.Close(routeSock)
-		if err != nil {
-			t.l.WithError(err).Error("failed to close AF_ROUTE socket")
-		}
-	}()
-
-	routeAddr := &netroute.Inet4Addr{}
-	maskAddr := &netroute.Inet4Addr{}
 	routes := *t.Routes.Load()
+
 	for _, r := range routes {
-		if r.Via == nil || !r.Install {
+		if len(r.Via) == 0 || !r.Install {
 			// We don't allow route MTUs so only install routes with a via
 			continue
 		}
 
-		copy(routeAddr.IP[:], r.Cidr.IP.To4())
-		copy(maskAddr.IP[:], net.IP(r.Cidr.Mask).To4())
-
-		err := addRoute(routeSock, routeAddr, maskAddr, t.linkAddr)
+		err := addRoute(r.Cidr, t.linkAddr)
 		if err != nil {
 			if errors.Is(err, unix.EEXIST) {
-				t.l.WithField("route", r.Cidr).
-					Warnf("unable to add unsafe_route, identical route already exists")
+				t.l.Warn("unable to add unsafe_route, identical route already exists", "route", r.Cidr)
 			} else {
-				retErr := util.NewContextualError("Failed to add route", map[string]interface{}{"route": r}, err)
+				retErr := util.NewContextualError("Failed to add route", map[string]any{"route": r}, err)
 				if logErrors {
 					retErr.Log(t.l)
 				} else {
@@ -406,7 +396,7 @@ func (t *tun) addRoutes(logErrors bool) error {
 				}
 			}
 		} else {
-			t.l.WithField("route", r).Info("Added route")
+			t.l.Info("Added route", "route", r)
 		}
 	}
 
@@ -414,57 +404,54 @@ func (t *tun) addRoutes(logErrors bool) error {
 }
 
 func (t *tun) removeRoutes(routes []Route) error {
-	routeSock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
-	if err != nil {
-		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
-	}
-
-	defer func() {
-		unix.Shutdown(routeSock, unix.SHUT_RDWR)
-		err := unix.Close(routeSock)
-		if err != nil {
-			t.l.WithError(err).Error("failed to close AF_ROUTE socket")
-		}
-	}()
-
-	routeAddr := &netroute.Inet4Addr{}
-	maskAddr := &netroute.Inet4Addr{}
-
 	for _, r := range routes {
 		if !r.Install {
 			continue
 		}
 
-		copy(routeAddr.IP[:], r.Cidr.IP.To4())
-		copy(maskAddr.IP[:], net.IP(r.Cidr.Mask).To4())
-
-		err := delRoute(routeSock, routeAddr, maskAddr, t.linkAddr)
+		err := delRoute(r.Cidr, t.linkAddr)
 		if err != nil {
-			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+			t.l.Error("Failed to remove route", "error", err, "route", r)
 		} else {
-			t.l.WithField("route", r).Info("Removed route")
+			t.l.Info("Removed route", "route", r)
 		}
 	}
 	return nil
 }
 
-func addRoute(sock int, addr, mask *netroute.Inet4Addr, link *netroute.LinkAddr) error {
-	r := netroute.RouteMessage{
+func addRoute(prefix netip.Prefix, gateway netroute.Addr) error {
+	sock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
+	}
+	defer unix.Close(sock)
+
+	route := &netroute.RouteMessage{
 		Version: unix.RTM_VERSION,
 		Type:    unix.RTM_ADD,
 		Flags:   unix.RTF_UP,
 		Seq:     1,
-		Addrs: []netroute.Addr{
-			unix.RTAX_DST:     addr,
-			unix.RTAX_GATEWAY: link,
-			unix.RTAX_NETMASK: mask,
-		},
 	}
 
-	data, err := r.Marshal()
+	if prefix.Addr().Is4() {
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet4Addr{IP: prefix.Masked().Addr().As4()},
+			unix.RTAX_NETMASK: &netroute.Inet4Addr{IP: prefixToMask(prefix).As4()},
+			unix.RTAX_GATEWAY: gateway,
+		}
+	} else {
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet6Addr{IP: prefix.Masked().Addr().As16()},
+			unix.RTAX_NETMASK: &netroute.Inet6Addr{IP: prefixToMask(prefix).As16()},
+			unix.RTAX_GATEWAY: gateway,
+		}
+	}
+
+	data, err := route.Marshal()
 	if err != nil {
 		return fmt.Errorf("failed to create route.RouteMessage: %w", err)
 	}
+
 	_, err = unix.Write(sock, data[:])
 	if err != nil {
 		return fmt.Errorf("failed to write route.RouteMessage to socket: %w", err)
@@ -473,19 +460,34 @@ func addRoute(sock int, addr, mask *netroute.Inet4Addr, link *netroute.LinkAddr)
 	return nil
 }
 
-func delRoute(sock int, addr, mask *netroute.Inet4Addr, link *netroute.LinkAddr) error {
-	r := netroute.RouteMessage{
+func delRoute(prefix netip.Prefix, gateway netroute.Addr) error {
+	sock, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
+	if err != nil {
+		return fmt.Errorf("unable to create AF_ROUTE socket: %v", err)
+	}
+	defer unix.Close(sock)
+
+	route := netroute.RouteMessage{
 		Version: unix.RTM_VERSION,
 		Type:    unix.RTM_DELETE,
 		Seq:     1,
-		Addrs: []netroute.Addr{
-			unix.RTAX_DST:     addr,
-			unix.RTAX_GATEWAY: link,
-			unix.RTAX_NETMASK: mask,
-		},
 	}
 
-	data, err := r.Marshal()
+	if prefix.Addr().Is4() {
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet4Addr{IP: prefix.Masked().Addr().As4()},
+			unix.RTAX_NETMASK: &netroute.Inet4Addr{IP: prefixToMask(prefix).As4()},
+			unix.RTAX_GATEWAY: gateway,
+		}
+	} else {
+		route.Addrs = []netroute.Addr{
+			unix.RTAX_DST:     &netroute.Inet6Addr{IP: prefix.Masked().Addr().As16()},
+			unix.RTAX_NETMASK: &netroute.Inet6Addr{IP: prefixToMask(prefix).As16()},
+			unix.RTAX_GATEWAY: gateway,
+		}
+	}
+
+	data, err := route.Marshal()
 	if err != nil {
 		return fmt.Errorf("failed to create route.RouteMessage: %w", err)
 	}
@@ -497,51 +499,115 @@ func delRoute(sock int, addr, mask *netroute.Inet4Addr, link *netroute.LinkAddr)
 	return nil
 }
 
+// tunWritev and tunReadv are linkname'd to x/sys/unix's libc-routed writev/readv stubs so the
+// calls go through libSystem's pinned trampoline. A raw syscall.Syscall(SYS_WRITEV/SYS_READV, ...)
+// on darwin/arm64 emits an SVC #0x80 trap (see $GOROOT/src/syscall/asm_darwin_arm64.s), the path
+// Apple keeps warning they will eventually disallow. We pull the low-level stubs instead of calling
+// unix.Writev/unix.Readv because those take [][]byte and rebuild the []Iovec every call, which
+// heap-allocates the header; linkname'ing the stubs lets us hand them our own stack-allocated
+// iovecs. See golang/go#78049.
+
+//go:linkname tunWritev golang.org/x/sys/unix.writev
+//go:noescape
+func tunWritev(fd int, iovecs []unix.Iovec) (n int, err error)
+
+//go:linkname tunReadv golang.org/x/sys/unix.readv
+//go:noescape
+func tunReadv(fd int, iovecs []unix.Iovec) (n int, err error)
+
+// Read pulls one IP packet off the utun device, scattering the 4 byte protocol header away from
+// the packet so the payload lands directly in to.
 func (t *tun) Read(to []byte) (int, error) {
+	var head [4]byte
 
-	buf := make([]byte, len(to)+4)
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	n, err := t.ReadWriteCloser.Read(buf)
-
-	copy(to, buf[4:])
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Read(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &to[0], Len: uint64(len(to))},
+		}
+		n, callErr = tunReadv(int(fd), iovecs)
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+	if n < 4 {
+		return 0, nil
+	}
+	return n - 4, nil
 }
 
-// Write is only valid for single threaded use
+// Write pushes one IP packet onto the utun device.
 func (t *tun) Write(from []byte) (int, error) {
-	buf := t.out
-	if cap(buf) < len(from)+4 {
-		buf = make([]byte, len(from)+4)
-		t.out = buf
-	}
-	buf = buf[:len(from)+4]
-
 	if len(from) == 0 {
 		return 0, syscall.EIO
 	}
 
-	// Determine the IP Family for the NULL L2 Header
 	ipVer := from[0] >> 4
-	if ipVer == 4 {
-		buf[3] = syscall.AF_INET
-	} else if ipVer == 6 {
-		buf[3] = syscall.AF_INET6
-	} else {
+	var head [4]byte
+	switch ipVer {
+	case 4:
+		head[3] = syscall.AF_INET
+	case 6:
+		head[3] = syscall.AF_INET6
+	default:
 		return 0, fmt.Errorf("unable to determine IP version from packet")
 	}
 
-	copy(buf[4:], from)
+	// Grab rc as a local so the compiler can devirtualize the call and keep the closure on the stack.
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	n, err := t.ReadWriteCloser.Write(buf)
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Write(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &from[0], Len: uint64(len(from))},
+		}
+		n, callErr = tunWritev(int(fd), iovecs)
+		// Type-assert to syscall.Errno so the EAGAIN/EWOULDBLOCK/EINTR check doesn't box the errno
+		// constants into error interfaces on every call.
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+
+	return n - 4, nil
 }
 
-func (t *tun) Cidr() *net.IPNet {
-	return t.cidr
+func (t *tun) Networks() []netip.Prefix {
+	return t.vpnNetworks
 }
 
 func (t *tun) Name() string {
 	return t.Device
+}
+
+func (t *tun) SupportsMultiqueue() bool {
+	return false
 }
 
 func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {

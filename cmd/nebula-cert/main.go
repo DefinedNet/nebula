@@ -5,9 +5,27 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
+	"strings"
 )
 
+// A version string that can be set with
+//
+//	-ldflags "-X main.Build=SOMEVERSION"
+//
+// at compile-time.
 var Build string
+
+func init() {
+	if Build == "" {
+		info, ok := debug.ReadBuildInfo()
+		if !ok {
+			return
+		}
+
+		Build = strings.TrimPrefix(info.Main.Version, "v")
+	}
+}
 
 type helpError struct {
 	s string
@@ -17,7 +35,7 @@ func (he *helpError) Error() string {
 	return he.s
 }
 
-func newHelpErrorf(s string, v ...interface{}) error {
+func newHelpErrorf(s string, v ...any) error {
 	return &helpError{s: fmt.Sprintf(s, v...)}
 }
 

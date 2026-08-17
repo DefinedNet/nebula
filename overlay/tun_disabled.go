@@ -1,31 +1,33 @@
 package overlay
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
+	"net/netip"
 	"strings"
 
 	"github.com/rcrowley/go-metrics"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/routing"
 )
 
 type disabledTun struct {
-	read chan []byte
-	cidr *net.IPNet
+	read        chan []byte
+	vpnNetworks []netip.Prefix
 
 	// Track these metrics since we don't have the tun device to do it for us
 	tx metrics.Counter
 	rx metrics.Counter
-	l  *logrus.Logger
+	l  *slog.Logger
 }
 
-func newDisabledTun(cidr *net.IPNet, queueLen int, metricsEnabled bool, l *logrus.Logger) *disabledTun {
+func newDisabledTun(vpnNetworks []netip.Prefix, queueLen int, metricsEnabled bool, l *slog.Logger) *disabledTun {
 	tun := &disabledTun{
-		cidr: cidr,
-		read: make(chan []byte, queueLen),
-		l:    l,
+		vpnNetworks: vpnNetworks,
+		read:        make(chan []byte, queueLen),
+		l:           l,
 	}
 
 	if metricsEnabled {
@@ -43,12 +45,12 @@ func (*disabledTun) Activate() error {
 	return nil
 }
 
-func (*disabledTun) RouteFor(iputil.VpnIp) iputil.VpnIp {
-	return 0
+func (*disabledTun) RoutesFor(addr netip.Addr) routing.Gateways {
+	return routing.Gateways{}
 }
 
-func (t *disabledTun) Cidr() *net.IPNet {
-	return t.cidr
+func (t *disabledTun) Networks() []netip.Prefix {
+	return t.vpnNetworks
 }
 
 func (*disabledTun) Name() string {
@@ -66,8 +68,8 @@ func (t *disabledTun) Read(b []byte) (int, error) {
 	}
 
 	t.tx.Inc(1)
-	if t.l.Level >= logrus.DebugLevel {
-		t.l.WithField("raw", prettyPacket(r)).Debugf("Write payload")
+	if t.l.Enabled(context.Background(), slog.LevelDebug) {
+		t.l.Debug("Write payload", "raw", prettyPacket(r))
 	}
 
 	return copy(b, r), nil
@@ -84,7 +86,7 @@ func (t *disabledTun) handleICMPEchoRequest(b []byte) bool {
 	select {
 	case t.read <- out:
 	default:
-		t.l.Debugf("tun_disabled: dropped ICMP Echo Reply response")
+		t.l.Debug("tun_disabled: dropped ICMP Echo Reply response")
 	}
 
 	return true
@@ -95,13 +97,17 @@ func (t *disabledTun) Write(b []byte) (int, error) {
 
 	// Check for ICMP Echo Request before spending time doing the full parsing
 	if t.handleICMPEchoRequest(b) {
-		if t.l.Level >= logrus.DebugLevel {
-			t.l.WithField("raw", prettyPacket(b)).Debugf("Disabled tun responded to ICMP Echo Request")
+		if t.l.Enabled(context.Background(), slog.LevelDebug) {
+			t.l.Debug("Disabled tun responded to ICMP Echo Request", "raw", prettyPacket(b))
 		}
-	} else if t.l.Level >= logrus.DebugLevel {
-		t.l.WithField("raw", prettyPacket(b)).Debugf("Disabled tun received unexpected payload")
+	} else if t.l.Enabled(context.Background(), slog.LevelDebug) {
+		t.l.Debug("Disabled tun received unexpected payload", "raw", prettyPacket(b))
 	}
 	return len(b), nil
+}
+
+func (t *disabledTun) SupportsMultiqueue() bool {
+	return true
 }
 
 func (t *disabledTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
